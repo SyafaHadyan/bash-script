@@ -49,4 +49,11 @@ cd ~/docker/prometheus/
 docker compose up -d
 cd ~
 
+# Swapfile
+sudo dd if=/dev/zero of=/swapfile bs=4096 count=1048576
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+echo "/swapfile none swap sw,pri=1 0 0" | sudo tee -a /etc/fstab
+sudo swapon -a
+
 echo "Please log out and log back in to refresh"
