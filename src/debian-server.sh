@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e
-
 # Package
 sudo apt update
 sudo apt upgrade -y
