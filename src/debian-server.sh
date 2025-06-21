@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e
-
 # Package
 sudo apt update
 sudo apt upgrade -y
@@ -35,10 +33,7 @@ sudo apt-get update
 sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
 
 # Setup user
-if ! getent group docker >/dev/null; then
-    sudo groupadd docker
-fi
-
+sudo groupadd docker
 sudo usermod -aG docker $USER
 
 # Docker etc
