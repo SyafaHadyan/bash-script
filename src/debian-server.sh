@@ -3,7 +3,7 @@
 # Package
 sudo apt update
 sudo apt upgrade -y
-sudo apt install htop wget kitty-terminfo ufw -y
+sudo apt install htop wget kitty-terminfo ufw cron -y
 
 # ufw
 sudo ufw allow OpenSSH
