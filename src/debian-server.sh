@@ -45,7 +45,7 @@ wget -O ~/docker/prometheus/compose.yml https://raw.githubusercontent.com/SyafaH
 wget -O ~/prometheus.yml https://raw.githubusercontent.com/SyafaHadyan/docker-sync/refs/heads/main/src/prometheus.yml
 
 # Swapfile
-sudo dd if=/dev/zero of=/swapfile bs=4096 count=1048576
+sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 echo "/swapfile none swap sw,pri=1 0 0" | sudo tee -a /etc/fstab
