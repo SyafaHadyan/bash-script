@@ -44,11 +44,6 @@ mkdir ~/docker/prometheus/
 wget -O ~/docker/prometheus/compose.yml https://raw.githubusercontent.com/SyafaHadyan/docker-compose/refs/heads/main/src/prometheus/prometheus.yml
 wget -O ~/prometheus.yml https://raw.githubusercontent.com/SyafaHadyan/docker-sync/refs/heads/main/src/prometheus.yml
 
-# Run Docker Compose Prometheus
-cd ~/docker/prometheus/
-docker compose up -d
-cd ~
-
 # Swapfile
 sudo dd if=/dev/zero of=/swapfile bs=4096 count=1048576
 sudo chmod 600 /swapfile
