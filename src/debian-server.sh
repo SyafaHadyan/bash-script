@@ -36,14 +36,6 @@ sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin 
 sudo groupadd docker
 sudo usermod -aG docker $USER
 
-# Docker etc
-mkdir ~/docker/
-mkdir ~/docker/prometheus/
-
-# Docker Compose Prometheus
-wget -O ~/docker/prometheus/compose.yml https://raw.githubusercontent.com/SyafaHadyan/docker-compose/refs/heads/main/src/prometheus/prometheus.yml
-wget -O ~/prometheus.yml https://raw.githubusercontent.com/SyafaHadyan/docker-sync/refs/heads/main/src/prometheus.yml
-
 # Swapfile
 sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
 sudo chmod 600 /swapfile
@@ -52,3 +44,4 @@ echo "/swapfile none swap sw,pri=1 0 0" | sudo tee -a /etc/fstab
 sudo swapon -a
 
 echo "Please log out and log back in to refresh"
+echo "Modify /etc/fstab as needed"
