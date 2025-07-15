@@ -9,5 +9,5 @@ curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/de
 ## Docker Prometheus
 
 ```
-curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/docker-prometheus.sh | sudo bash
+curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/docker-prometheus.sh | bash
 ```
