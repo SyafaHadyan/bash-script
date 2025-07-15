@@ -3,7 +3,7 @@
 ## debian-server
 
 ```
-curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/debian-server.sh | sudo sh
+curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/debian-server.sh | sh
 ```
 
 ## Docker Prometheus
