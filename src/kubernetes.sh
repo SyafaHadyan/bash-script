@@ -17,9 +17,11 @@ echo \
   sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
 sudo apt-get update
 
-# Install containerd
-sudo apt -y install containerd.io
-sudo systemctl enable --now containerd
+# Install Docker
+sudo apt-get -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo groupadd docker
+sudo usermod -aG docker $USER
 
 # Install kubeadm
 sudo apt-get update
@@ -30,3 +32,7 @@ sudo apt-get update
 sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 sudo systemctl enable --now kubelet
+
+echo "===================="
+echo "please log out and log back in"
+echo "===================="
