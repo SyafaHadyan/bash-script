@@ -1,13 +1,7 @@
 # Bash Script
 
-## debian-server
+## debian
 
 ```
-curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/debian-server.sh | sh
-```
-
-## Docker Prometheus
-
-```
-curl -fsSL https://github.com/SyafaHadyan/bash-script/raw/refs/heads/main/src/docker-prometheus.sh | sh
+curl -fsSL https://syafahadyan.com/debian.sh | sh
 ```
