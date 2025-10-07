@@ -1,6 +1,7 @@
 #!/bin/bash
 
 sudo apt update
+sudo apt -y install ssh
 
 # Add Docker's official GPG key:
 sudo apt-get update
