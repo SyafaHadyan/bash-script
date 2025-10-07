@@ -3,5 +3,5 @@
 ## debian
 
 ```
-curl -fsSL https://syafahadyan.com/debian.sh | sh
+curl -fsSL https://script.syafahadyan.com/debian.sh | sh
 ```
