@@ -1,7 +1,6 @@
 #!/bin/bash
 
 sudo apt update
-sudo apt -y install wget tar
 
 # Add Docker's official GPG key:
 sudo apt-get update
