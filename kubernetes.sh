@@ -1,6 +1,7 @@
 #!/bin/bash
 
 sudo apt update
+sudo apt -y install ssh
 
 # Add Docker's official GPG key:
 sudo apt-get update
@@ -31,6 +32,10 @@ sudo apt-get update
 sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 sudo systemctl enable --now kubelet
+
+# Install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --operator=$USER
 
 echo ""
 echo "===================="
