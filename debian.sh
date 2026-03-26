@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euxo pipefail
+
 sudo apt update
 sudo apt -y install ssh
 
