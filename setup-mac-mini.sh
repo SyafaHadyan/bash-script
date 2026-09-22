@@ -26,7 +26,9 @@
 #   6. Set "start up automatically when power is restored" (pmset autorestart)
 #      - the closest real equivalent Mac Mini exposes to "power on when AC
 #      connected"; there is no literal laptop-style AC-power-on toggle.
-#   7. Install Homebrew (if missing) and Android Studio for General.
+#   7. Enable Remote Login (SSH) and Remote Management/Screen Sharing
+#      (access granted to General).
+#   8. Install Homebrew (if missing) and Android Studio for General.
 #
 # Other subcommands:
 #   update     re-copy an updated script and (re-)register the daemon;
@@ -73,7 +75,7 @@ GENERAL_PASS="123456789"
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG ANDROID_STUDIO)
+STEPS=(LAB_PREFS GENERAL_CREATED SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -205,6 +207,25 @@ write_kcpassword() {
   chmod 600 "$out"
 }
 
+suppress_first_login_setup_assistant() {
+  local user="$1"
+  log "pre-seeding SetupAssistant markers for $user so first-login onboarding screens don't block auto-login"
+  local os_version os_build
+  os_version=$(sw_vers -productVersion)
+  os_build=$(sw_vers -buildVersion)
+  sudo -u "$user" defaults write com.apple.SetupAssistant DidSeeCloudSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant DidSeeSiriSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant DidSeePrivacy -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant DidSeePrivacyAppBundle -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant DidSeeTrueTonePairing -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant DidSeeAppearanceSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant LastSeenCloudProductVersion -string "$os_version"
+  sudo -u "$user" defaults write com.apple.SetupAssistant LastSeenBuddyBuildVersion -string "$os_build"
+  # These exact keys/panes have shifted across macOS releases (same
+  # unreliability class as auto-login itself) - if a screen still appears
+  # on first login, check what's new for this OS version and add its key.
+}
+
 configure_autologin() {
   local user="$1" pass="$2"
   log "configuring auto-login for $user (legacy mechanism, verify manually if it doesn't take effect)"
@@ -243,9 +264,27 @@ wait_for_internet() {
   log "internet connectivity confirmed"
 }
 
-upgrade_macos() {
-  wait_for_internet
+# Live check instead of a trusted flag, deliberately: this step's own
+# reboot can kill the script before we can honestly confirm success, so
+# "done" must be verified against actual system state every time rather
+# than assumed the moment the install/update command was launched.
+os_update_pending() {
+  local current_major latest_version latest_major
+  current_major=$(sw_vers -productVersion | cut -d. -f1)
+  latest_version=$(softwareupdate --list-full-installers 2>/dev/null \
+    | grep -o 'Version: [0-9.]*' | sed 's/Version: //' \
+    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  latest_major=$(echo "$latest_version" | cut -d. -f1)
+  if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
+    return 0
+  fi
+  if softwareupdate -l 2>&1 | grep -qi "no new software available"; then
+    return 1
+  fi
+  return 0
+}
 
+upgrade_macos() {
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
   latest_version=$(softwareupdate --list-full-installers 2>/dev/null \
@@ -259,7 +298,6 @@ upgrade_macos() {
     local installer_app
     installer_app=$(ls -d "/Applications/Install macOS"*.app 2>/dev/null | head -1)
     if [ -n "$installer_app" ]; then
-      mark_done OS_UPDATE
       log "starting macOS upgrade install, machine will restart automatically when ready"
       "$installer_app/Contents/Resources/startosinstall" --agreetolicense --nointeraction --restart 2>&1 | tee -a "$LOG_FILE"
       exit 0
@@ -271,7 +309,6 @@ upgrade_macos() {
   local out
   out=$(softwareupdate -ia --restart 2>&1)
   echo "$out" | tee -a "$LOG_FILE"
-  mark_done OS_UPDATE
   if ! echo "$out" | grep -qi "No updates are available"; then
     # softwareupdate's own --restart will reboot the machine shortly.
     exit 0
@@ -294,6 +331,23 @@ install_homebrew_for_user() {
     2>&1 | tee -a "$LOG_FILE"
 }
 
+configure_brew_shellenv_for_user() {
+  local user="$1" home line profile
+  home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -z "$home" ] && home="/Users/$user"
+  profile="$home/.zprofile"
+  line="eval \"\$($BREW_PREFIX/bin/brew shellenv)\""
+  # brew's installer only prints this as a suggested next step, it never
+  # touches shell config itself - without it, `brew`/anything it installs
+  # is invisible to a Terminal the user actually opens.
+  if [ -f "$profile" ] && grep -qF "$line" "$profile"; then
+    log "Homebrew shellenv already configured for $user"
+    return
+  fi
+  log "adding Homebrew shellenv to $profile"
+  sudo -u "$user" /usr/bin/env bash -c "printf '%s\n' '$line' >> '$profile'"
+}
+
 install_android_studio_for_user() {
   local user="$1"
   if sudo -u "$user" test -d "/Applications/Android Studio.app"; then
@@ -307,6 +361,21 @@ install_android_studio_for_user() {
 configure_power_on_ac() {
   log "enabling automatic startup after power is restored (closest Mac equivalent to power-on-when-AC-connected)"
   pmset -a autorestart 1
+}
+
+enable_remote_login() {
+  log "enabling Remote Login (SSH)"
+  systemsetup -setremotelogin on 2>&1 | tee -a "$LOG_FILE"
+}
+
+enable_remote_management() {
+  local user="$1"
+  log "enabling Remote Management (Screen Sharing) for $user"
+  /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+    -activate -configure -access -on \
+    -privs -all \
+    -users "$user" \
+    -restart -agent -menu 2>&1 | tee -a "$LOG_FILE"
 }
 
 uninstall_daemon() {
@@ -362,6 +431,13 @@ run_steps() {
     mark_done GENERAL_CREATED
   fi
 
+  if ! is_done SETUP_ASSISTANT; then
+    if require_done GENERAL_CREATED; then
+      suppress_first_login_setup_assistant "$GENERAL_USER"
+      mark_done SETUP_ASSISTANT
+    fi
+  fi
+
   if ! is_done GENERAL_PREFS; then
     if require_done GENERAL_CREATED; then
       apply_user_prefs "$GENERAL_USER"
@@ -375,7 +451,18 @@ run_steps() {
   fi
 
   if ! is_done OS_UPDATE; then
-    upgrade_macos
+    wait_for_internet
+    if os_update_pending; then
+      upgrade_macos
+      # only reaches here if upgrade_macos didn't need to trigger its own
+      # reboot (e.g. it found nothing left to do after all); re-check below
+      # rather than assuming that means success.
+    fi
+    if os_update_pending; then
+      log "WARNING: macOS update still appears pending, will retry on next run"
+    else
+      mark_done OS_UPDATE
+    fi
   fi
 
   if ! is_done POWER_CONFIG; then
@@ -383,9 +470,28 @@ run_steps() {
     mark_done POWER_CONFIG
   fi
 
-  if ! is_done ANDROID_STUDIO; then
+  if ! is_done SSH_ENABLED; then
+    enable_remote_login
+    mark_done SSH_ENABLED
+  fi
+
+  if ! is_done REMOTE_DESKTOP; then
+    if require_done GENERAL_CREATED; then
+      enable_remote_management "$GENERAL_USER"
+      mark_done REMOTE_DESKTOP
+    fi
+  fi
+
+  if ! is_done HOMEBREW; then
     if require_done GENERAL_CREATED; then
       install_homebrew_for_user "$GENERAL_USER"
+      configure_brew_shellenv_for_user "$GENERAL_USER"
+      mark_done HOMEBREW
+    fi
+  fi
+
+  if ! is_done ANDROID_STUDIO; then
+    if require_done HOMEBREW; then
       install_android_studio_for_user "$GENERAL_USER"
       mark_done ANDROID_STUDIO
     fi
