@@ -15,9 +15,11 @@
 # Steps performed, in order, each skipped if already done:
 #   1. Detect the existing "Lab Pembelajaran N" account, set dark mode,
 #      max mouse tracking speed, and non-inverted scrolling for it.
-#   2. Create an admin account "General" (password 123456789), disable
-#      FileVault (required for auto-login to work at all), configure
-#      auto-login as General.
+#   2. Create an admin account "General" (password 123456789), grant it a
+#      Secure Token (via the Lab account's credentials - without this,
+#      General can't authorize OS installs at all), disable FileVault
+#      (required for auto-login to work at all), configure auto-login as
+#      General.
 #   3. Apply the same appearance/mouse prefs to General.
 #   4. Print a large completion banner.
 #   5. Wait for internet, then upgrade macOS to the latest available major
@@ -70,12 +72,13 @@ PLIST_PATH="/Library/LaunchDaemons/$LABEL.plist"
 
 GENERAL_USER="General"
 GENERAL_PASS="123456789"
+LAB_PASS="12345"
 
 # Every step tracked here, in the order run_steps executes them. Completion
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -174,6 +177,29 @@ create_general_account() {
   fi
   log "creating admin account $GENERAL_USER"
   sysadminctl -addUser "$GENERAL_USER" -fullName "$GENERAL_USER" -password "$GENERAL_PASS" -admin 2>&1 | tee -a "$LOG_FILE"
+}
+
+has_secure_token() {
+  sysadminctl -secureTokenStatus "$1" 2>&1 | grep -qi "ENABLED"
+}
+
+grant_secure_token() {
+  local target_user="$1" target_pass="$2" admin_user="$3" admin_pass="$4"
+  # A newly created account has no Secure Token unless granted by an
+  # existing Secure Token holder authenticating for it. Without one, macOS
+  # refuses to let that account authorize OS installs/updates on the boot
+  # volume ("you need to be an owner of this Mac" in the installer GUI).
+  if has_secure_token "$target_user"; then
+    log "$target_user already has a Secure Token"
+    return
+  fi
+  if [ -z "$admin_user" ]; then
+    log "WARNING: no existing Secure Token holder found to grant one to $target_user"
+    return
+  fi
+  log "granting Secure Token to $target_user via $admin_user"
+  sysadminctl -secureTokenOn "$target_user" -password "$target_pass" \
+    -adminUser "$admin_user" -adminPassword "$admin_pass" 2>&1 | tee -a "$LOG_FILE"
 }
 
 disable_filevault_if_needed() {
@@ -429,6 +455,17 @@ run_steps() {
     disable_filevault_if_needed
     configure_autologin "$GENERAL_USER" "$GENERAL_PASS"
     mark_done GENERAL_CREATED
+  fi
+
+  if ! is_done SECURE_TOKEN; then
+    if require_done GENERAL_CREATED; then
+      grant_secure_token "$GENERAL_USER" "$GENERAL_PASS" "$(find_lab_user)" "$LAB_PASS"
+      if has_secure_token "$GENERAL_USER"; then
+        mark_done SECURE_TOKEN
+      else
+        log "WARNING: $GENERAL_USER still lacks a Secure Token, will retry next run"
+      fi
+    fi
   fi
 
   if ! is_done SETUP_ASSISTANT; then
