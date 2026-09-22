@@ -65,12 +65,21 @@ set -uo pipefail
 STATE_DIR="/var/db/macsetup"
 DONE_DIR="$STATE_DIR/done"
 LOCK_DIR="$STATE_DIR/run.lock"
+GENERAL_USER_FILE="$STATE_DIR/general_username"
 LOG_FILE="/var/log/mac-mini-setup.log"
 SCRIPT_INSTALL_PATH="/usr/local/mac-setup/mac_mini_setup.sh"
 LABEL="com.labsetup.macsetup"
 PLIST_PATH="/Library/LaunchDaemons/$LABEL.plist"
 
-GENERAL_USER="General"
+# The account name is chosen interactively once, during install (the one
+# point a human is actually at a terminal) and persisted here. Every later
+# automatic 'run' (triggered by the daemon, no TTY attached) just reads it
+# back instead of prompting - a prompt would hang forever with no input.
+if [ -f "$GENERAL_USER_FILE" ]; then
+  GENERAL_USER=$(cat "$GENERAL_USER_FILE")
+else
+  GENERAL_USER="General"
+fi
 GENERAL_PASS="123456789"
 LAB_PASS="12345"
 
@@ -274,7 +283,7 @@ banner() {
   console_user=$(stat -f%Su /dev/console 2>/dev/null || echo "")
   if [ -n "$console_user" ] && [ "$console_user" != "root" ] && [ "$console_user" != "loginwindow" ]; then
     sudo -u "$console_user" osascript -e \
-      "display alert \"$msg\" message \"Lab and General accounts are configured. Now checking for macOS updates.\" as informational giving up after 15" \
+      "display alert \"$msg\" message \"Lab and $GENERAL_USER accounts are configured. Now checking for macOS updates.\" as informational giving up after 15" \
       >/dev/null 2>&1
   fi
 }
@@ -434,6 +443,27 @@ enable_remote_management() {
     -restart -agent -menu 2>&1 | tee -a "$LOG_FILE"
 }
 
+prompt_for_general_username() {
+  if [ -f "$GENERAL_USER_FILE" ]; then
+    log "using previously chosen admin account name: $GENERAL_USER"
+    return
+  fi
+  local name confirm
+  while true; do
+    read -rp "Account name for the new admin account [General]: " name
+    name="${name:-General}"
+    read -rp "Create admin account named '$name'? [y/N]: " confirm
+    case "$confirm" in
+      [yY]|[yY][eE][sS]) break ;;
+      *) echo "Okay, let's try again." ;;
+    esac
+  done
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$name" > "$GENERAL_USER_FILE"
+  GENERAL_USER="$name"
+  log "admin account name set to: $GENERAL_USER"
+}
+
 uninstall_daemon() {
   launchctl bootout system "$PLIST_PATH" >/dev/null 2>&1 || launchctl unload "$PLIST_PATH" >/dev/null 2>&1
   rm -f "$PLIST_PATH"
@@ -580,6 +610,7 @@ run_steps() {
 
 install() {
   need_root
+  prompt_for_general_username
   mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
   cp "$0" "$SCRIPT_INSTALL_PATH"
   chmod 755 "$SCRIPT_INSTALL_PATH"
@@ -636,6 +667,7 @@ case "${1:-}" in
   update) need_root; update ;;
   run) need_root; run_steps ;;
   status)
+    echo "admin account name: $GENERAL_USER"
     echo "steps:"
     for s in "${STEPS[@]}"; do
       if is_done "$s"; then echo "  [x] $s"; else echo "  [ ] $s"; fi
@@ -646,7 +678,8 @@ case "${1:-}" in
   reset)
     need_root
     rm -rf "$DONE_DIR"
-    echo "progress reset, next 'install'/'update' or daemon run starts from step 1"
+    rm -f "$GENERAL_USER_FILE"
+    echo "progress reset, next 'install'/'update' or daemon run starts from step 1 (will re-prompt for account name)"
     ;;
   uninstall)
     need_root
