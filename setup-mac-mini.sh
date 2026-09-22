@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# mac_mini_setup.sh - unattended Mac Mini lab provisioning
+# setup-mac-mini.sh - unattended Mac Mini lab provisioning
 #
 # Usage (run on the target Mac Mini, logged into the pre-existing
 # "Lab Pembelajaran N" account, in Terminal):
 #
-#   sudo bash mac_mini_setup.sh install
+#   sudo bash setup-mac-mini.sh install
 #
 # That copies itself to /usr/local/mac-setup, registers a LaunchDaemon that
 # fires on every boot, and runs the first step immediately. From then on the
@@ -26,9 +26,17 @@
 #   6. Set "start up automatically when power is restored" (pmset autorestart)
 #      - the closest real equivalent Mac Mini exposes to "power on when AC
 #      connected"; there is no literal laptop-style AC-power-on toggle.
+#   7. Install Homebrew (if missing) and Android Studio for General.
 #
 # Other subcommands:
-#   status     print current state + recent log lines
+#   update     re-copy an updated script and (re-)register the daemon;
+#              run this after adding/changing steps to apply them to a
+#              machine that's already partway done or fully finished -
+#              each step's completion is tracked independently (a marker
+#              file per step name, not a single furthest-position pointer),
+#              so new steps can be inserted or appended anywhere without
+#              disturbing steps already completed on that machine
+#   status     show which steps are done/pending + recent log lines
 #   reset      forget all progress, so a re-run starts from step 1 again
 #              (use this when re-purposing the script for a *new* Mac Mini)
 #   uninstall  remove the LaunchDaemon without touching recorded progress
@@ -51,7 +59,7 @@
 set -uo pipefail
 
 STATE_DIR="/var/db/macsetup"
-STATE_FILE="$STATE_DIR/state"
+DONE_DIR="$STATE_DIR/done"
 LOCK_DIR="$STATE_DIR/run.lock"
 LOG_FILE="/var/log/mac-mini-setup.log"
 SCRIPT_INSTALL_PATH="/usr/local/mac-setup/mac_mini_setup.sh"
@@ -61,7 +69,17 @@ PLIST_PATH="/Library/LaunchDaemons/$LABEL.plist"
 GENERAL_USER="General"
 GENERAL_PASS="123456789"
 
-STATES=(NEW LAB_PREFS_DONE GENERAL_CREATED GENERAL_PREFS_DONE BANNER_SHOWN OS_UPDATED POWER_CONFIGURED DONE)
+# Every step tracked here, in the order run_steps executes them. Completion
+# is tracked per-name (a marker file per step), not by position in this
+# list, so a new step can be inserted or appended anywhere later without
+# affecting whether already-finished steps re-run.
+STEPS=(LAB_PREFS GENERAL_CREATED GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG ANDROID_STUDIO)
+
+if [ "$(uname -m)" = "arm64" ]; then
+  BREW_PREFIX="/opt/homebrew"
+else
+  BREW_PREFIX="/usr/local"
+fi
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -74,29 +92,35 @@ need_root() {
   fi
 }
 
-get_state() {
-  cat "$STATE_FILE" 2>/dev/null || echo "NEW"
+is_done() {
+  [ -f "$DONE_DIR/$1" ]
 }
 
-set_state() {
-  mkdir -p "$STATE_DIR"
-  echo "$1" > "$STATE_FILE"
-  log "state -> $1"
+mark_done() {
+  mkdir -p "$DONE_DIR"
+  touch "$DONE_DIR/$1"
+  log "marked done: $1"
 }
 
-state_index() {
-  local target="$1" i
-  for i in "${!STATES[@]}"; do
-    [ "${STATES[$i]}" = "$target" ] && { echo "$i"; return; }
+all_done() {
+  local s
+  for s in "${STEPS[@]}"; do
+    is_done "$s" || return 1
   done
-  echo -1
+  return 0
 }
 
-at_least() {
-  local cur tgt
-  cur=$(state_index "$(get_state)")
-  tgt=$(state_index "$1")
-  [ "$cur" -ge "$tgt" ]
+# Guards steps that depend on another step having actually run first
+# (e.g. anything touching General's account needs GENERAL_CREATED). Returns
+# failure without marking the caller done, so it's retried on a later pass
+# instead of being marked complete despite its prerequisite missing -
+# matters if the step blocks below ever get reordered in the script.
+require_done() {
+  if ! is_done "$1"; then
+    log "WARNING: prerequisite '$1' not done yet, skipping this step for now"
+    return 1
+  fi
+  return 0
 }
 
 find_lab_user() {
@@ -223,7 +247,7 @@ upgrade_macos() {
     local installer_app
     installer_app=$(ls -d "/Applications/Install macOS"*.app 2>/dev/null | head -1)
     if [ -n "$installer_app" ]; then
-      set_state OS_UPDATED
+      mark_done OS_UPDATE
       log "starting macOS upgrade install, machine will restart automatically when ready"
       "$installer_app/Contents/Resources/startosinstall" --agreetolicense --nointeraction --restart 2>&1 | tee -a "$LOG_FILE"
       exit 0
@@ -235,11 +259,37 @@ upgrade_macos() {
   local out
   out=$(softwareupdate -ia --restart 2>&1)
   echo "$out" | tee -a "$LOG_FILE"
-  set_state OS_UPDATED
+  mark_done OS_UPDATE
   if ! echo "$out" | grep -qi "No updates are available"; then
     # softwareupdate's own --restart will reboot the machine shortly.
     exit 0
   fi
+}
+
+install_homebrew_for_user() {
+  local user="$1"
+  if sudo -u "$user" test -x "$BREW_PREFIX/bin/brew"; then
+    log "Homebrew already installed for $user"
+    return
+  fi
+  log "installing Homebrew for $user"
+  # Homebrew refuses to run as root, and its installer needs the prefix dir
+  # to already be writable by the target user to avoid its own sudo prompts.
+  mkdir -p "$BREW_PREFIX"
+  chown -R "$user:admin" "$BREW_PREFIX"
+  sudo -u "$user" /bin/bash -c \
+    "NONINTERACTIVE=1 $(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
+    2>&1 | tee -a "$LOG_FILE"
+}
+
+install_android_studio_for_user() {
+  local user="$1"
+  if sudo -u "$user" test -d "/Applications/Android Studio.app"; then
+    log "Android Studio already installed"
+    return
+  fi
+  log "installing Android Studio via Homebrew cask for $user"
+  sudo -u "$user" "$BREW_PREFIX/bin/brew" install --cask android-studio 2>&1 | tee -a "$LOG_FILE"
 }
 
 configure_power_on_ac() {
@@ -280,9 +330,9 @@ run_steps() {
     exit 0
   fi
   trap release_lock EXIT
-  log "=== run started, current state: $(get_state) ==="
+  log "=== run started ==="
 
-  if ! at_least LAB_PREFS_DONE; then
+  if ! is_done LAB_PREFS; then
     local labuser
     labuser=$(find_lab_user)
     if [ -z "$labuser" ]; then
@@ -290,42 +340,51 @@ run_steps() {
       exit 1
     fi
     apply_user_prefs "$labuser"
-    set_state LAB_PREFS_DONE
+    mark_done LAB_PREFS
   fi
 
-  if ! at_least GENERAL_CREATED; then
+  if ! is_done GENERAL_CREATED; then
     create_general_account
     disable_filevault_if_needed
     configure_autologin "$GENERAL_USER" "$GENERAL_PASS"
-    set_state GENERAL_CREATED
+    mark_done GENERAL_CREATED
   fi
 
-  if ! at_least GENERAL_PREFS_DONE; then
-    apply_user_prefs "$GENERAL_USER"
-    set_state GENERAL_PREFS_DONE
+  if ! is_done GENERAL_PREFS; then
+    if require_done GENERAL_CREATED; then
+      apply_user_prefs "$GENERAL_USER"
+      mark_done GENERAL_PREFS
+    fi
   fi
 
-  if ! at_least BANNER_SHOWN; then
+  if ! is_done BANNER; then
     banner
-    set_state BANNER_SHOWN
+    mark_done BANNER
   fi
 
-  if ! at_least OS_UPDATED; then
+  if ! is_done OS_UPDATE; then
     upgrade_macos
   fi
 
-  if ! at_least POWER_CONFIGURED; then
+  if ! is_done POWER_CONFIG; then
     configure_power_on_ac
-    set_state POWER_CONFIGURED
+    mark_done POWER_CONFIG
   fi
 
-  if ! at_least DONE; then
-    set_state DONE
-    log "all steps complete, removing scheduled daemon"
+  if ! is_done ANDROID_STUDIO; then
+    if require_done GENERAL_CREATED; then
+      install_homebrew_for_user "$GENERAL_USER"
+      install_android_studio_for_user "$GENERAL_USER"
+      mark_done ANDROID_STUDIO
+    fi
+  fi
+
+  if all_done; then
+    log "all currently defined steps complete, removing scheduled daemon"
     uninstall_daemon
   fi
 
-  log "=== run finished, state: $(get_state) ==="
+  log "=== run finished ==="
 }
 
 install() {
@@ -333,8 +392,7 @@ install() {
   mkdir -p "$(dirname "$SCRIPT_INSTALL_PATH")"
   cp "$0" "$SCRIPT_INSTALL_PATH"
   chmod 755 "$SCRIPT_INSTALL_PATH"
-  mkdir -p "$STATE_DIR"
-  [ -f "$STATE_FILE" ] || set_state NEW
+  mkdir -p "$DONE_DIR"
 
   cat > "$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -360,29 +418,44 @@ PLIST
   log "installed at $SCRIPT_INSTALL_PATH, daemon registered and started"
 }
 
+# Same as install(): re-copies the (possibly updated) script and makes sure
+# the daemon is registered and running. Safe to call on an already-finished
+# machine - existing step markers under $DONE_DIR are untouched, so this
+# only picks up steps that don't have a marker yet (e.g. newly added ones).
+update() {
+  install
+}
+
 usage() {
   cat <<EOF
 Usage: sudo bash $0 <command>
   install    copy self, register LaunchDaemon, start provisioning
+  update     re-copy an updated script and (re-)register the daemon; use
+             this after adding/changing steps in the script on a machine
+             that's already partway through or fully finished
   run        run one pass of the state machine (used by the daemon)
-  status     show current state and recent log output
-  reset      clear recorded progress (start over, e.g. for a new Mac Mini)
-  uninstall  remove the LaunchDaemon (progress state is left untouched)
+  status     show which steps are done/pending and recent log output
+  reset      forget all progress (start over, e.g. for a new Mac Mini)
+  uninstall  remove the LaunchDaemon (progress markers are left untouched)
 EOF
 }
 
 case "${1:-}" in
-  install) install ;;
+  install) need_root; install ;;
+  update) need_root; update ;;
   run) need_root; run_steps ;;
   status)
-    echo "state: $(get_state)"
+    echo "steps:"
+    for s in "${STEPS[@]}"; do
+      if is_done "$s"; then echo "  [x] $s"; else echo "  [ ] $s"; fi
+    done
     echo "---- last 40 log lines ----"
     tail -n 40 "$LOG_FILE" 2>/dev/null
     ;;
   reset)
     need_root
-    rm -f "$STATE_FILE"
-    echo "progress reset, next 'install' or daemon run starts from step 1"
+    rm -rf "$DONE_DIR"
+    echo "progress reset, next 'install'/'update' or daemon run starts from step 1"
     ;;
   uninstall)
     need_root
