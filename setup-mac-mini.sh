@@ -78,7 +78,7 @@ LAB_PASS="12345"
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SUDO_NOPASSWD SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -389,6 +389,36 @@ configure_power_on_ac() {
   pmset -a autorestart 1
 }
 
+configure_passwordless_sudo_for_admin() {
+  local marker="/etc/sudoers.d/99-admin-nopasswd"
+  if [ -f "$marker" ]; then
+    log "passwordless sudo for admin already configured (marker file present)"
+    return 0
+  fi
+  if grep -RqsE '^[[:space:]]*%admin[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL' \
+      /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
+    log "an existing %admin NOPASSWD rule already exists in sudoers config, skipping"
+    return 0
+  fi
+  log "adding passwordless sudo for admin group"
+  local tmp
+  tmp=$(mktemp)
+  echo "%admin ALL=(ALL) NOPASSWD: ALL" > "$tmp"
+  # Never touch /etc/sudoers directly - validate with visudo's own syntax
+  # checker first, same as visudo itself does, so a bad rule can't lock out
+  # sudo. sudo re-reads its config on every invocation, so this takes effect
+  # immediately, no separate "refresh"/reload step exists or is needed.
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    install -m 0440 -o root -g wheel "$tmp" "$marker"
+    rm -f "$tmp"
+    log "passwordless sudo for admin group installed at $marker"
+    return 0
+  fi
+  rm -f "$tmp"
+  log "ERROR: generated sudoers snippet failed visudo syntax check, not installing"
+  return 1
+}
+
 enable_remote_login() {
   log "enabling Remote Login (SSH)"
   systemsetup -setremotelogin on 2>&1 | tee -a "$LOG_FILE"
@@ -505,6 +535,12 @@ run_steps() {
   if ! is_done POWER_CONFIG; then
     configure_power_on_ac
     mark_done POWER_CONFIG
+  fi
+
+  if ! is_done SUDO_NOPASSWD; then
+    if configure_passwordless_sudo_for_admin; then
+      mark_done SUDO_NOPASSWD
+    fi
   fi
 
   if ! is_done SSH_ENABLED; then
