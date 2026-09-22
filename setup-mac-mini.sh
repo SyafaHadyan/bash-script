@@ -88,7 +88,7 @@ LAB_PASS="12345"
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SUDO_NOPASSWD SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SWITCH_TO_GENERAL SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -165,13 +165,36 @@ set_dark_mode() {
 }
 
 set_mouse_sensitivity_max() {
+  # The Mouse settings pane actually writes tracking speed to the per-machine
+  # ByHost domain (-currentHost), not the plain global domain - writing only
+  # the plain domain leaves the value invisible to the pane/HID system until
+  # next login. Write both so it's correct regardless of which one is read.
   sudo -u "$1" defaults write NSGlobalDomain com.apple.mouse.scaling -float 3.0
+  sudo -u "$1" defaults -currentHost write NSGlobalDomain com.apple.mouse.scaling -float 3.0
 }
 
 set_mouse_not_inverted() {
   # "natural scrolling" is the only inversion toggle macOS exposes for
-  # pointing devices; false = traditional/non-inverted direction.
+  # pointing devices; false = traditional/non-inverted direction. Same
+  # ByHost caveat as tracking speed above.
   sudo -u "$1" defaults write NSGlobalDomain com.apple.swipescrolldirection -bool false
+  sudo -u "$1" defaults -currentHost write NSGlobalDomain com.apple.swipescrolldirection -bool false
+}
+
+# Nudges an already-running session to actually reflect prefs just written
+# to disk. Only meaningful when $user is the currently active console user
+# (e.g. Lab, since it's live while this script runs) - a brand new account's
+# first-ever login reads these files fresh anyway and needs no nudge.
+live_refresh_user_prefs() {
+  local user="$1"
+  [ "$(stat -f%Su /dev/console 2>/dev/null)" = "$user" ] || return
+  sudo -u "$user" osascript -e 'tell application "System Events" to tell appearance preferences to set dark mode to true' >/dev/null 2>&1
+  sudo -u "$user" killall cfprefsd >/dev/null 2>&1
+  sudo -u "$user" killall Dock >/dev/null 2>&1
+  sudo -u "$user" killall SystemUIServer >/dev/null 2>&1
+  # Mouse tracking speed specifically has no reliable live-refresh hook short
+  # of logout/login - this is a platform limitation, not something to trust
+  # blindly took effect. Verify manually if it still looks unchanged on screen.
 }
 
 apply_user_prefs() {
@@ -180,10 +203,7 @@ apply_user_prefs() {
   set_dark_mode "$user"
   set_mouse_sensitivity_max "$user"
   set_mouse_not_inverted "$user"
-  if [ "$(stat -f%Su /dev/console)" = "$user" ]; then
-    sudo -u "$user" killall Dock >/dev/null 2>&1
-    sudo -u "$user" killall SystemUIServer >/dev/null 2>&1
-  fi
+  live_refresh_user_prefs "$user"
 }
 
 create_general_account() {
@@ -275,6 +295,38 @@ configure_autologin() {
   write_kcpassword "$pass"
 }
 
+# Logs the current session out so auto-login (already configured by this
+# point) brings General up right away, instead of waiting for the eventual
+# OS-upgrade reboot. Best-effort and one-shot: attempted once regardless of
+# outcome, not retried every run - auto-login's own reliability is already a
+# known caveat, and repeatedly trying to force a logout every boot would be
+# disruptive if it's genuinely not going to take effect.
+switch_to_general() {
+  local console_user labuser
+  console_user=$(stat -f%Su /dev/console 2>/dev/null || echo "")
+  if [ "$console_user" = "$GENERAL_USER" ]; then
+    log "$GENERAL_USER is already the active session, nothing to switch"
+    return
+  fi
+  labuser=$(find_lab_user)
+  if [ -z "$labuser" ] || [ "$console_user" != "$labuser" ]; then
+    log "WARNING: current console user ('$console_user') isn't the Lab account, skipping automatic switch to $GENERAL_USER"
+    return
+  fi
+  set_phase "logging out $labuser so auto-login brings up $GENERAL_USER"
+  sudo -u "$labuser" osascript -e 'tell application "loginwindow" to «event aevtrlgo»' >/dev/null 2>&1
+  local n=0
+  while [ "$(stat -f%Su /dev/console 2>/dev/null)" != "$GENERAL_USER" ] && [ "$n" -lt 60 ]; do
+    sleep 2
+    n=$((n + 1))
+  done
+  if [ "$(stat -f%Su /dev/console 2>/dev/null)" = "$GENERAL_USER" ]; then
+    log "switched to $GENERAL_USER"
+  else
+    log "WARNING: did not see $GENERAL_USER become the active session after logout, auto-login may not have taken effect - verify manually"
+  fi
+}
+
 banner() {
   local msg="CORE SETUP STEPS COMPLETE"
   {
@@ -344,7 +396,13 @@ upgrade_macos() {
     installer_app=$(ls -d "/Applications/Install macOS"*.app 2>/dev/null | head -1)
     if [ -n "$installer_app" ]; then
       set_phase "installing macOS $latest_version - machine will restart automatically when ready"
-      "$installer_app/Contents/Resources/startosinstall" --agreetolicense --nointeraction --restart 2>&1 | tee -a "$LOG_FILE"
+      # A Secure Token alone doesn't tell startosinstall which account to
+      # authenticate as - without --user/--stdinpass it falls back to an
+      # interactive password prompt, which hangs forever with no TTY here.
+      printf '%s' "$GENERAL_PASS" | "$installer_app/Contents/Resources/startosinstall" \
+        --agreetolicense --nointeraction --restart \
+        --user "$GENERAL_USER" --stdinpass \
+        2>&1 | tee -a "$LOG_FILE"
       exit 0
     fi
     log "WARNING: full installer app not found after fetch, falling back to incremental updates"
@@ -538,6 +596,19 @@ run_steps() {
     fi
   fi
 
+  if ! is_done SUDO_NOPASSWD; then
+    if configure_passwordless_sudo_for_admin; then
+      mark_done SUDO_NOPASSWD
+    fi
+  fi
+
+  if ! is_done SWITCH_TO_GENERAL; then
+    if require_done GENERAL_CREATED; then
+      switch_to_general
+      mark_done SWITCH_TO_GENERAL
+    fi
+  fi
+
   if ! is_done SETUP_ASSISTANT; then
     if require_done GENERAL_CREATED; then
       suppress_first_login_setup_assistant "$GENERAL_USER"
@@ -575,12 +646,6 @@ run_steps() {
   if ! is_done POWER_CONFIG; then
     configure_power_on_ac
     mark_done POWER_CONFIG
-  fi
-
-  if ! is_done SUDO_NOPASSWD; then
-    if configure_passwordless_sudo_for_admin; then
-      mark_done SUDO_NOPASSWD
-    fi
   fi
 
   if ! is_done SSH_ENABLED; then
