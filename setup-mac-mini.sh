@@ -124,7 +124,19 @@ require_done() {
 }
 
 find_lab_user() {
-  dscl . -list /Users 2>/dev/null | grep -E '^Lab Pembelajaran [0-9]+$' | head -1
+  # The account's short (Unix) username usually isn't "Lab Pembelajaran N"
+  # verbatim - macOS's Setup Assistant strips spaces/lowercases it when
+  # generating the short name from the full name typed at first boot. Match
+  # on RealName (the actual full name) and resolve back to the short name.
+  local user
+  user=$(dscl . -list /Users RealName 2>/dev/null \
+    | grep -E '^[^[:space:]]+[[:space:]]+Lab Pembelajaran [0-9]+$' \
+    | awk '{print $1}' \
+    | head -1)
+  if [ -z "$user" ]; then
+    user=$(dscl . -list /Users 2>/dev/null | grep -E '^Lab Pembelajaran [0-9]+$' | head -1)
+  fi
+  echo "$user"
 }
 
 set_dark_mode() {
