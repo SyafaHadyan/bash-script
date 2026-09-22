@@ -65,6 +65,7 @@ set -uo pipefail
 STATE_DIR="/var/db/macsetup"
 DONE_DIR="$STATE_DIR/done"
 LOCK_DIR="$STATE_DIR/run.lock"
+PHASE_FILE="$STATE_DIR/phase"
 GENERAL_USER_FILE="$STATE_DIR/general_username"
 LOG_FILE="/var/log/mac-mini-setup.log"
 SCRIPT_INSTALL_PATH="/usr/local/mac-setup/mac_mini_setup.sh"
@@ -97,6 +98,12 @@ fi
 
 log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+set_phase() {
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$1" >"$PHASE_FILE"
+  log "phase: $1"
 }
 
 need_root() {
@@ -291,7 +298,7 @@ banner() {
 }
 
 wait_for_internet() {
-  log "waiting for internet connectivity..."
+  set_phase "waiting for internet connectivity"
   local n=0
   until curl -fsS --max-time 5 https://captive.apple.com/hotspot-detect.html >/dev/null 2>&1; do
     n=$((n + 1))
@@ -322,6 +329,7 @@ os_update_pending() {
 }
 
 upgrade_macos() {
+  set_phase "checking for available macOS updates"
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
   latest_version=$(softwareupdate --list-full-installers 2>/dev/null |
@@ -330,19 +338,19 @@ upgrade_macos() {
   latest_major=$(echo "$latest_version" | cut -d. -f1)
 
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
-    log "newer major macOS version available ($latest_version), fetching full installer"
+    set_phase "fetching full macOS installer (version $latest_version)"
     softwareupdate --fetch-full-installer --full-installer-version "$latest_version" 2>&1 | tee -a "$LOG_FILE"
     local installer_app
     installer_app=$(ls -d "/Applications/Install macOS"*.app 2>/dev/null | head -1)
     if [ -n "$installer_app" ]; then
-      log "starting macOS upgrade install, machine will restart automatically when ready"
+      set_phase "installing macOS $latest_version - machine will restart automatically when ready"
       "$installer_app/Contents/Resources/startosinstall" --agreetolicense --nointeraction --restart 2>&1 | tee -a "$LOG_FILE"
       exit 0
     fi
     log "WARNING: full installer app not found after fetch, falling back to incremental updates"
   fi
 
-  log "applying available incremental updates"
+  set_phase "applying available incremental macOS updates"
   local out
   out=$(softwareupdate -ia --restart 2>&1)
   echo "$out" | tee -a "$LOG_FILE"
@@ -358,7 +366,7 @@ install_homebrew_for_user() {
     log "Homebrew already installed for $user"
     return
   fi
-  log "installing Homebrew for $user"
+  set_phase "installing Homebrew for $user"
   # Homebrew refuses to run as root, and its installer needs the prefix dir
   # to already be writable by the target user to avoid its own sudo prompts.
   mkdir -p "$BREW_PREFIX"
@@ -391,7 +399,7 @@ install_android_studio_for_user() {
     log "Android Studio already installed"
     return
   fi
-  log "installing Android Studio via Homebrew cask for $user"
+  set_phase "installing Android Studio via Homebrew cask for $user"
   sudo -u "$user" "$BREW_PREFIX/bin/brew" install --cask android-studio 2>&1 | tee -a "$LOG_FILE"
 }
 
@@ -607,6 +615,7 @@ run_steps() {
     uninstall_daemon
   fi
 
+  set_phase "idle"
   log "=== run finished ==="
 }
 
@@ -679,6 +688,7 @@ run)
   ;;
 status)
   echo "admin account name: $GENERAL_USER"
+  echo "current phase: $(cat "$PHASE_FILE" 2>/dev/null || echo "idle")"
   echo "steps:"
   for s in "${STEPS[@]}"; do
     if is_done "$s"; then echo "  [x] $s"; else echo "  [ ] $s"; fi
