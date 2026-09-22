@@ -143,10 +143,10 @@ find_lab_user() {
   # generating the short name from the full name typed at first boot. Match
   # on RealName (the actual full name) and resolve back to the short name.
   local user
-  user=$(dscl . -list /Users RealName 2>/dev/null \
-    | grep -E '^[^[:space:]]+[[:space:]]+Lab Pembelajaran [0-9]+$' \
-    | awk '{print $1}' \
-    | head -1)
+  user=$(dscl . -list /Users RealName 2>/dev/null |
+    grep -E '^[^[:space:]]+[[:space:]]+Lab Pembelajaran [0-9]+$' |
+    awk '{print $1}' |
+    head -1)
   if [ -z "$user" ]; then
     user=$(dscl . -list /Users 2>/dev/null | grep -E '^Lab Pembelajaran [0-9]+$' | head -1)
   fi
@@ -228,7 +228,7 @@ write_kcpassword() {
   local key=(125 137 82 35 210 188 221 234 163 185 31)
   local i len byte kbyte xbyte
   len=${#pass}
-  : > "$out"
+  : >"$out"
   for ((i = 0; i <= len; i++)); do
     if [ "$i" -lt "$len" ]; then
       byte=$(printf '%d' "'${pass:$i:1}")
@@ -237,7 +237,7 @@ write_kcpassword() {
     fi
     kbyte=${key[$((i % ${#key[@]}))]}
     xbyte=$((byte ^ kbyte))
-    printf "\\$(printf '%03o' "$xbyte")" >> "$out"
+    printf "\\$(printf '%03o' "$xbyte")" >>"$out"
   done
   chmod 600 "$out"
 }
@@ -272,11 +272,13 @@ banner() {
   local msg="CORE SETUP STEPS COMPLETE"
   {
     printf '\n'
-    printf '#%.0s' $(seq 1 70); printf '\n'
+    printf '#%.0s' $(seq 1 70)
+    printf '\n'
     printf '\n'
     printf '     %s\n' "$msg"
     printf '\n'
-    printf '#%.0s' $(seq 1 70); printf '\n\n'
+    printf '#%.0s' $(seq 1 70)
+    printf '\n\n'
   } | tee -a "$LOG_FILE"
 
   local console_user
@@ -306,9 +308,9 @@ wait_for_internet() {
 os_update_pending() {
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
-  latest_version=$(softwareupdate --list-full-installers 2>/dev/null \
-    | grep -o 'Version: [0-9.]*' | sed 's/Version: //' \
-    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  latest_version=$(softwareupdate --list-full-installers 2>/dev/null |
+    grep -o 'Version: [0-9.]*' | sed 's/Version: //' |
+    sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
   latest_major=$(echo "$latest_version" | cut -d. -f1)
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
     return 0
@@ -322,9 +324,9 @@ os_update_pending() {
 upgrade_macos() {
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
-  latest_version=$(softwareupdate --list-full-installers 2>/dev/null \
-    | grep -o 'Version: [0-9.]*' | sed 's/Version: //' \
-    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  latest_version=$(softwareupdate --list-full-installers 2>/dev/null |
+    grep -o 'Version: [0-9.]*' | sed 's/Version: //' |
+    sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
   latest_major=$(echo "$latest_version" | cut -d. -f1)
 
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
@@ -405,14 +407,14 @@ configure_passwordless_sudo_for_admin() {
     return 0
   fi
   if grep -RqsE '^[[:space:]]*%admin[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL' \
-      /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
+    /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
     log "an existing %admin NOPASSWD rule already exists in sudoers config, skipping"
     return 0
   fi
   log "adding passwordless sudo for admin group"
   local tmp
   tmp=$(mktemp)
-  echo "%admin ALL=(ALL) NOPASSWD: ALL" > "$tmp"
+  echo "%admin ALL=(ALL) NOPASSWD: ALL" >"$tmp"
   # Never touch /etc/sudoers directly - validate with visudo's own syntax
   # checker first, same as visudo itself does, so a bad rule can't lock out
   # sudo. sudo re-reads its config on every invocation, so this takes effect
@@ -454,12 +456,12 @@ prompt_for_general_username() {
     name="${name:-General}"
     read -rp "Create admin account named '$name'? [y/N]: " confirm
     case "$confirm" in
-      [yY]|[yY][eE][sS]) break ;;
-      *) echo "Okay, let's try again." ;;
+    [yY] | [yY][eE][sS]) break ;;
+    *) echo "Okay, let's try again." ;;
     esac
   done
   mkdir -p "$STATE_DIR"
-  printf '%s' "$name" > "$GENERAL_USER_FILE"
+  printf '%s' "$name" >"$GENERAL_USER_FILE"
   GENERAL_USER="$name"
   log "admin account name set to: $GENERAL_USER"
 }
@@ -472,7 +474,7 @@ uninstall_daemon() {
 acquire_lock() {
   mkdir -p "$STATE_DIR"
   if mkdir "$LOCK_DIR" 2>/dev/null; then
-    echo $$ > "$LOCK_DIR/pid"
+    echo $$ >"$LOCK_DIR/pid"
     return 0
   fi
   local existing_pid
@@ -480,7 +482,7 @@ acquire_lock() {
   if [ -n "$existing_pid" ] && ! kill -0 "$existing_pid" 2>/dev/null; then
     log "reclaiming stale lock left by dead pid $existing_pid"
     rm -rf "$LOCK_DIR"
-    mkdir "$LOCK_DIR" 2>/dev/null && echo $$ > "$LOCK_DIR/pid" && return 0
+    mkdir "$LOCK_DIR" 2>/dev/null && echo $$ >"$LOCK_DIR/pid" && return 0
   fi
   return 1
 }
@@ -616,7 +618,7 @@ install() {
   chmod 755 "$SCRIPT_INSTALL_PATH"
   mkdir -p "$DONE_DIR"
 
-  cat > "$PLIST_PATH" <<PLIST
+  cat >"$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -663,28 +665,40 @@ EOF
 }
 
 case "${1:-}" in
-  install) need_root; install ;;
-  update) need_root; update ;;
-  run) need_root; run_steps ;;
-  status)
-    echo "admin account name: $GENERAL_USER"
-    echo "steps:"
-    for s in "${STEPS[@]}"; do
-      if is_done "$s"; then echo "  [x] $s"; else echo "  [ ] $s"; fi
-    done
-    echo "---- last 40 log lines ----"
-    tail -n 40 "$LOG_FILE" 2>/dev/null
-    ;;
-  reset)
-    need_root
-    rm -rf "$DONE_DIR"
-    rm -f "$GENERAL_USER_FILE"
-    echo "progress reset, next 'install'/'update' or daemon run starts from step 1 (will re-prompt for account name)"
-    ;;
-  uninstall)
-    need_root
-    uninstall_daemon
-    echo "daemon removed, recorded progress left in place"
-    ;;
-  *) usage; exit 1 ;;
+install)
+  need_root
+  install
+  ;;
+update)
+  need_root
+  update
+  ;;
+run)
+  need_root
+  run_steps
+  ;;
+status)
+  echo "admin account name: $GENERAL_USER"
+  echo "steps:"
+  for s in "${STEPS[@]}"; do
+    if is_done "$s"; then echo "  [x] $s"; else echo "  [ ] $s"; fi
+  done
+  echo "---- last 40 log lines ----"
+  tail -n 40 "$LOG_FILE" 2>/dev/null
+  ;;
+reset)
+  need_root
+  rm -rf "$DONE_DIR"
+  rm -f "$GENERAL_USER_FILE"
+  echo "progress reset, next 'install'/'update' or daemon run starts from step 1 (will re-prompt for account name)"
+  ;;
+uninstall)
+  need_root
+  uninstall_daemon
+  echo "daemon removed, recorded progress left in place"
+  ;;
+*)
+  usage
+  exit 1
+  ;;
 esac
