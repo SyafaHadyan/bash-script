@@ -37,12 +37,13 @@
 #      Homebrew cask, which has had compatibility bugs on very new macOS
 #      versions), pre-configured to skip sending usage statistics. The
 #      first-run setup wizard itself is not suppressed - a person still
-#      clicks through it once at the monitor. Clean up General's Dock down
-#      to just Finder/Launchpad/Android Studio/Terminal and remove all
-#      widgets/stacks (via dockutil). Install Tailscale (Homebrew cask) last
-#      and add it as a login item so it launches automatically - the actual
-#      "connect this device" login is deliberately not automated, do that
-#      manually at the monitor.
+#      clicks through it once at the monitor. Install Tailscale (Homebrew
+#      cask) and add it as a login item so it launches automatically - the
+#      actual "connect this device" login is deliberately not automated, do
+#      that manually at the monitor. Last: clean up General's Dock down to
+#      just Finder/Android Studio and remove all widgets/stacks (via
+#      dockutil) - run after Tailscale specifically since installing/
+#      launching it pins its own icon to the Dock too, which this wipes.
 #
 # Other subcommands:
 #   update     re-copy an updated script and (re-)register the daemon;
@@ -100,7 +101,7 @@ LAB_PASS="12345"
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SWITCH_TO_GENERAL SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO DOCK_CLEANUP TAILSCALE)
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SWITCH_TO_GENERAL SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO TAILSCALE DOCK_CLEANUP)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -656,15 +657,13 @@ install_dockutil_for_user() {
 }
 
 # Finder isn't a persistent-apps entry at all (it's a fixed tile dockutil
-# doesn't touch), so the kept set here only needs to name the other three.
+# doesn't touch), so the kept set here only needs to name Android Studio.
 dock_cleaned_up() {
   local user="$1" names extra
   names=$(sudo -u "$user" "$BREW_PREFIX/bin/dockutil" --list 2>/dev/null | cut -f1)
   [ -z "$names" ] && return 1
-  echo "$names" | grep -qx "Launchpad" || return 1
   echo "$names" | grep -qx "Android Studio" || return 1
-  echo "$names" | grep -qx "Terminal" || return 1
-  extra=$(echo "$names" | grep -vxE 'Launchpad|Android Studio|Terminal')
+  extra=$(echo "$names" | grep -vxE 'Android Studio')
   [ -z "$extra" ]
 }
 
@@ -675,18 +674,18 @@ configure_dock_for_user() {
     return 1
   fi
   if dock_cleaned_up "$user"; then
-    log "Dock already cleaned up for $user (Finder/Launchpad/Android Studio/Terminal only, no widgets)"
+    log "Dock already cleaned up for $user (Finder/Android Studio only, no widgets)"
     return 0
   fi
-  log "cleaning up Dock for $user: unpinning everything except Finder/Launchpad/Android Studio/Terminal, removing widgets"
+  log "cleaning up Dock for $user: unpinning everything except Finder/Android Studio, removing widgets"
   # dockutil's "all" clears the whole dock plist in one go - both the
   # left-side pinned-apps section and the right-side folders/stacks/widgets
   # section - so this single call covers "remove all widgets" too, not just
-  # the app icons.
+  # the app icons. Runs after TAILSCALE (see run_steps ordering) so that
+  # Tailscale auto-pinning itself to the Dock on install/first launch gets
+  # wiped along with everything else, rather than surviving the cleanup.
   sudo -u "$user" "$dockutil" --remove all --no-restart
-  sudo -u "$user" "$dockutil" --add '/System/Applications/Launchpad.app' --no-restart
   sudo -u "$user" "$dockutil" --add '/Applications/Android Studio.app' --no-restart
-  sudo -u "$user" "$dockutil" --add '/System/Applications/Utilities/Terminal.app' --no-restart
   sudo -u "$user" killall Dock >/dev/null 2>&1
   if dock_cleaned_up "$user"; then
     log "Dock cleaned up for $user"
@@ -971,16 +970,16 @@ check_state() {
     check_line ANDROID_STUDIO 0 "not satisfied"
   fi
 
-  if dock_cleaned_up "$GENERAL_USER"; then
-    check_line DOCK_CLEANUP 1 "confirmed"
-  else
-    check_line DOCK_CLEANUP 0 "not satisfied"
-  fi
-
   if tailscale_installed; then
     check_line TAILSCALE 1 "confirmed"
   else
     check_line TAILSCALE 0 "not satisfied"
+  fi
+
+  if dock_cleaned_up "$GENERAL_USER"; then
+    check_line DOCK_CLEANUP 1 "confirmed"
+  else
+    check_line DOCK_CLEANUP 0 "not satisfied"
   fi
 
   echo
@@ -1061,13 +1060,13 @@ reconcile_state() {
     log "reconcile: Android Studio already installed, backfilling ANDROID_STUDIO"
     mark_done ANDROID_STUDIO
   fi
-  if ! is_done DOCK_CLEANUP && dock_cleaned_up "$GENERAL_USER"; then
-    log "reconcile: Dock already cleaned up for $GENERAL_USER, backfilling DOCK_CLEANUP"
-    mark_done DOCK_CLEANUP
-  fi
   if ! is_done TAILSCALE && tailscale_installed; then
     log "reconcile: Tailscale already installed, backfilling TAILSCALE"
     mark_done TAILSCALE
+  fi
+  if ! is_done DOCK_CLEANUP && dock_cleaned_up "$GENERAL_USER"; then
+    log "reconcile: Dock already cleaned up for $GENERAL_USER, backfilling DOCK_CLEANUP"
+    mark_done DOCK_CLEANUP
   fi
 }
 
@@ -1213,21 +1212,6 @@ run_steps() {
     fi
   fi
 
-  if ! is_done DOCK_CLEANUP; then
-    # Needs both: ANDROID_STUDIO so there's actually an app to pin, and
-    # HOMEBREW since configure_dock_for_user installs dockutil via brew -
-    # without this second guard, a machine where HOMEBREW got skipped would
-    # have this step fail every single run with no obvious cause (brew
-    # simply not existing yet at $BREW_PREFIX), instead of clearly waiting.
-    if require_done ANDROID_STUDIO && require_done HOMEBREW; then
-      if configure_dock_for_user "$GENERAL_USER"; then
-        mark_done DOCK_CLEANUP
-      else
-        log "WARNING: Dock cleanup for $GENERAL_USER did not succeed, will retry next run"
-      fi
-    fi
-  fi
-
   if ! is_done TAILSCALE; then
     if require_done HOMEBREW; then
       if install_tailscale_for_user "$GENERAL_USER"; then
@@ -1235,6 +1219,22 @@ run_steps() {
         mark_done TAILSCALE
       else
         log "WARNING: Tailscale installation did not succeed, will retry next run"
+      fi
+    fi
+  fi
+
+  if ! is_done DOCK_CLEANUP; then
+    # Runs last, after ANDROID_STUDIO (needs the app to pin) and TAILSCALE
+    # (Tailscale pins itself to the Dock on install/first launch - cleanup
+    # needs to happen after that so it gets wiped too, not before it exists)
+    # - and HOMEBREW since configure_dock_for_user installs dockutil via
+    # brew. Without these guards, a machine where an earlier one of these
+    # got skipped would have this step fail every run with no obvious cause.
+    if require_done ANDROID_STUDIO && require_done HOMEBREW && require_done TAILSCALE; then
+      if configure_dock_for_user "$GENERAL_USER"; then
+        mark_done DOCK_CLEANUP
+      else
+        log "WARNING: Dock cleanup for $GENERAL_USER did not succeed, will retry next run"
       fi
     fi
   fi
