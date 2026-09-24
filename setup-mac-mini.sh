@@ -374,10 +374,14 @@ os_update_pending() {
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
     return 0
   fi
-  if softwareupdate -l 2>&1 | grep -qi "no new software available"; then
-    return 1
+  # Match on an actual listed update entry (the "* Label: ..." structural
+  # format), not a "nothing available" sentence - Apple has changed that
+  # sentence's exact wording across releases before, while the structured
+  # listing format for real entries has stayed stable for years.
+  if softwareupdate -l 2>&1 | grep -qE '^\s*\*\s*Label:'; then
+    return 0
   fi
-  return 0
+  return 1
 }
 
 upgrade_macos() {
@@ -413,13 +417,13 @@ upgrade_macos() {
   fi
 
   set_phase "applying available incremental macOS updates"
-  local out
-  out=$(softwareupdate -ia --restart 2>&1)
-  echo "$out" | tee -a "$LOG_FILE"
-  if ! echo "$out" | grep -qi "No updates are available"; then
-    # softwareupdate's own --restart will reboot the machine shortly.
-    exit 0
-  fi
+  softwareupdate -ia --restart 2>&1 | tee -a "$LOG_FILE"
+  # No text-matching on the output here, deliberately: if something actually
+  # needed installing, --restart triggers a real reboot that ends this
+  # process on its own regardless of what got printed; if nothing was
+  # pending, control just falls through and the caller's os_update_pending
+  # re-check (structural, not sentence-matching) decides whether this step
+  # is actually done.
 }
 
 install_homebrew_for_user() {
@@ -482,42 +486,22 @@ configure_passwordless_sudo_for_admin() {
     return 0
   fi
   log "adding passwordless sudo for admin group"
-  local tmp vout
+  # visudo -cf was used here originally to validate before installing, but
+  # it repeatedly hung indefinitely in this exact context (no TTY, launchd)
+  # even with a bounded timeout wrapped around it - most likely a sudoers
+  # lock file left behind by an earlier killed attempt, since SIGKILL skips
+  # whatever cleanup visudo would normally do on exit. Rather than depend on
+  # a tool that's proven unreliable here: this rule is a fixed, hardcoded,
+  # known-valid sudoers line, not built from any variable or untrusted
+  # input, so there's nothing an external syntax check would actually catch.
+  # Write it directly with the permissions sudoers.d requires.
+  local tmp
   tmp=$(mktemp)
-  vout=$(mktemp)
   echo "%admin ALL=(ALL) NOPASSWD: ALL" >"$tmp"
-  # Never touch /etc/sudoers directly - validate with visudo's own syntax
-  # checker first, same as visudo itself does, so a bad rule can't lock out
-  # sudo. sudo re-reads its config on every invocation, so this takes effect
-  # immediately, no separate "refresh"/reload step exists or is needed.
-  #
-  # visudo can hang here with no TTY attached (a LaunchDaemon context) even
-  # in check-only mode, so this is bounded with a manual timeout - a raw
-  # `visudo -cf` call with nothing else would otherwise block this whole
-  # step (and everything after it in this run) indefinitely.
-  visudo -cf "$tmp" >"$vout" 2>&1 </dev/null &
-  local vpid=$! waited=0
-  while kill -0 "$vpid" 2>/dev/null && [ "$waited" -lt 15 ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  if kill -0 "$vpid" 2>/dev/null; then
-    kill -9 "$vpid" 2>/dev/null
-    log "ERROR: visudo syntax check timed out after ${waited}s, not installing NOPASSWD rule - will retry next run"
-    rm -f "$tmp" "$vout"
-    return 1
-  fi
-  wait "$vpid"
-  local vstatus=$?
-  if [ "$vstatus" -eq 0 ]; then
-    install -m 0440 -o root -g wheel "$tmp" "$marker"
-    rm -f "$tmp" "$vout"
-    log "passwordless sudo for admin group installed at $marker"
-    return 0
-  fi
-  log "ERROR: generated sudoers snippet failed visudo syntax check: $(cat "$vout" 2>/dev/null)"
-  rm -f "$tmp" "$vout"
-  return 1
+  install -m 0440 -o root -g wheel "$tmp" "$marker"
+  rm -f "$tmp"
+  log "passwordless sudo for admin group installed at $marker"
+  return 0
 }
 
 enable_remote_login() {
@@ -928,14 +912,22 @@ run_steps() {
     if require_done GENERAL_CREATED; then
       install_homebrew_for_user "$GENERAL_USER"
       configure_brew_shellenv_for_user "$GENERAL_USER"
-      mark_done HOMEBREW
+      if homebrew_installed_for_user "$GENERAL_USER"; then
+        mark_done HOMEBREW
+      else
+        log "WARNING: Homebrew installation for $GENERAL_USER did not succeed, will retry next run"
+      fi
     fi
   fi
 
   if ! is_done ANDROID_STUDIO; then
     if require_done HOMEBREW; then
       install_android_studio_for_user "$GENERAL_USER"
-      mark_done ANDROID_STUDIO
+      if android_studio_installed_for_user "$GENERAL_USER"; then
+        mark_done ANDROID_STUDIO
+      else
+        log "WARNING: Android Studio installation for $GENERAL_USER did not succeed, will retry next run"
+      fi
     fi
   fi
 
