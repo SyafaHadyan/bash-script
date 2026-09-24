@@ -557,6 +557,126 @@ release_lock() {
   rm -rf "$LOCK_DIR"
 }
 
+# Live-state predicates used by reconcile_state() below, reusing checks
+# already embedded in each step's own function where one exists.
+general_account_exists() {
+  dscl . -list /Users 2>/dev/null | grep -qx "$GENERAL_USER"
+}
+
+admin_nopasswd_present() {
+  [ -f "/etc/sudoers.d/99-admin-nopasswd" ] && return 0
+  grep -RqsE '^[[:space:]]*%admin[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL' \
+    /etc/sudoers /etc/sudoers.d/ 2>/dev/null
+}
+
+setup_assistant_suppressed() {
+  [ "$(sudo -u "$1" defaults read com.apple.SetupAssistant DidSeeCloudSetup 2>/dev/null)" = "1" ]
+}
+
+user_prefs_applied() {
+  local user="$1" style scroll scaling
+  style=$(sudo -u "$user" defaults read NSGlobalDomain AppleInterfaceStyle 2>/dev/null)
+  scroll=$(sudo -u "$user" defaults read NSGlobalDomain com.apple.swipescrolldirection 2>/dev/null)
+  scaling=$(sudo -u "$user" defaults read NSGlobalDomain com.apple.mouse.scaling 2>/dev/null)
+  [ "$style" = "Dark" ] || return 1
+  [ "$scroll" = "0" ] || return 1
+  awk -v v="${scaling:-0}" 'BEGIN{exit !(v+0>=2.9)}'
+}
+
+power_autorestart_enabled() {
+  pmset -g | grep -qE 'autorestart[[:space:]]+1'
+}
+
+remote_login_enabled() {
+  systemsetup -getremotelogin 2>/dev/null | grep -qi "On"
+}
+
+# Best-effort only - kickstart has no simple, documented one-line status
+# check, this is a commonly used proxy, not a guaranteed-accurate signal.
+remote_management_enabled() {
+  [ "$(defaults read /Library/Preferences/com.apple.RemoteManagement.plist ARD_AllLocalUsers 2>/dev/null)" = "1" ]
+}
+
+homebrew_installed_for_user() {
+  sudo -u "$1" test -x "$BREW_PREFIX/bin/brew"
+}
+
+android_studio_installed_for_user() {
+  sudo -u "$1" test -d "/Applications/Android Studio.app"
+}
+
+# Runs before the main step sequence on every pass. A step's marker file is
+# the fast path, but it isn't the only source of truth: markers can go
+# missing or stop matching after the script itself changes (a step gets
+# renamed, or the tracking mechanism changes, as already happened once in
+# this script's history), and re-running some steps unmarked is more than
+# just wasted time - REMOTE_DESKTOP's kickstart restarts the ARD agent and
+# would interrupt an active screen-sharing session every single boot if its
+# marker kept coming up missing. So: check live system state too, and
+# backfill the marker if reality already satisfies it, instead of trusting
+# the marker file alone. Not every step has a cheap, reliable live signal
+# (BANNER has no system state to check; SWITCH_TO_GENERAL and REMOTE_DESKTOP
+# already self-guard inside their own functions too) - this covers the
+# steps where one exists.
+reconcile_state() {
+  if ! is_done LAB_PREFS; then
+    local labuser
+    labuser=$(find_lab_user)
+    if [ -n "$labuser" ] && user_prefs_applied "$labuser"; then
+      log "reconcile: appearance/mouse prefs already applied to $labuser, backfilling LAB_PREFS"
+      mark_done LAB_PREFS
+    fi
+  fi
+  if ! is_done GENERAL_CREATED && general_account_exists; then
+    log "reconcile: $GENERAL_USER account already exists, backfilling GENERAL_CREATED"
+    mark_done GENERAL_CREATED
+  fi
+  if ! is_done SECURE_TOKEN && has_secure_token "$GENERAL_USER"; then
+    log "reconcile: $GENERAL_USER already has a Secure Token, backfilling SECURE_TOKEN"
+    mark_done SECURE_TOKEN
+  fi
+  if ! is_done SUDO_NOPASSWD && admin_nopasswd_present; then
+    log "reconcile: admin NOPASSWD rule already present, backfilling SUDO_NOPASSWD"
+    mark_done SUDO_NOPASSWD
+  fi
+  if ! is_done SWITCH_TO_GENERAL && [ "$(stat -f%Su /dev/console 2>/dev/null)" = "$GENERAL_USER" ]; then
+    log "reconcile: $GENERAL_USER is already the active session, backfilling SWITCH_TO_GENERAL"
+    mark_done SWITCH_TO_GENERAL
+  fi
+  if ! is_done SETUP_ASSISTANT && setup_assistant_suppressed "$GENERAL_USER"; then
+    log "reconcile: SetupAssistant markers already present for $GENERAL_USER, backfilling SETUP_ASSISTANT"
+    mark_done SETUP_ASSISTANT
+  fi
+  if ! is_done GENERAL_PREFS && user_prefs_applied "$GENERAL_USER"; then
+    log "reconcile: appearance/mouse prefs already applied to $GENERAL_USER, backfilling GENERAL_PREFS"
+    mark_done GENERAL_PREFS
+  fi
+  if ! is_done OS_UPDATE && ! os_update_pending; then
+    log "reconcile: no macOS update pending, backfilling OS_UPDATE"
+    mark_done OS_UPDATE
+  fi
+  if ! is_done POWER_CONFIG && power_autorestart_enabled; then
+    log "reconcile: power-on-after-failure already enabled, backfilling POWER_CONFIG"
+    mark_done POWER_CONFIG
+  fi
+  if ! is_done SSH_ENABLED && remote_login_enabled; then
+    log "reconcile: Remote Login already enabled, backfilling SSH_ENABLED"
+    mark_done SSH_ENABLED
+  fi
+  if ! is_done REMOTE_DESKTOP && remote_management_enabled; then
+    log "reconcile: Remote Management already enabled, backfilling REMOTE_DESKTOP"
+    mark_done REMOTE_DESKTOP
+  fi
+  if ! is_done HOMEBREW && homebrew_installed_for_user "$GENERAL_USER"; then
+    log "reconcile: Homebrew already installed for $GENERAL_USER, backfilling HOMEBREW"
+    mark_done HOMEBREW
+  fi
+  if ! is_done ANDROID_STUDIO && android_studio_installed_for_user "$GENERAL_USER"; then
+    log "reconcile: Android Studio already installed, backfilling ANDROID_STUDIO"
+    mark_done ANDROID_STUDIO
+  fi
+}
+
 run_steps() {
   mkdir -p "$STATE_DIR"
   touch "$LOG_FILE"
@@ -566,6 +686,7 @@ run_steps() {
   fi
   trap release_lock EXIT
   log "=== run started ==="
+  reconcile_state
 
   if ! is_done LAB_PREFS; then
     local labuser
