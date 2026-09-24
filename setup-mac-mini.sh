@@ -482,21 +482,41 @@ configure_passwordless_sudo_for_admin() {
     return 0
   fi
   log "adding passwordless sudo for admin group"
-  local tmp
+  local tmp vout
   tmp=$(mktemp)
+  vout=$(mktemp)
   echo "%admin ALL=(ALL) NOPASSWD: ALL" >"$tmp"
   # Never touch /etc/sudoers directly - validate with visudo's own syntax
   # checker first, same as visudo itself does, so a bad rule can't lock out
   # sudo. sudo re-reads its config on every invocation, so this takes effect
   # immediately, no separate "refresh"/reload step exists or is needed.
-  if visudo -cf "$tmp" >/dev/null 2>&1; then
+  #
+  # visudo can hang here with no TTY attached (a LaunchDaemon context) even
+  # in check-only mode, so this is bounded with a manual timeout - a raw
+  # `visudo -cf` call with nothing else would otherwise block this whole
+  # step (and everything after it in this run) indefinitely.
+  visudo -cf "$tmp" >"$vout" 2>&1 </dev/null &
+  local vpid=$! waited=0
+  while kill -0 "$vpid" 2>/dev/null && [ "$waited" -lt 15 ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if kill -0 "$vpid" 2>/dev/null; then
+    kill -9 "$vpid" 2>/dev/null
+    log "ERROR: visudo syntax check timed out after ${waited}s, not installing NOPASSWD rule - will retry next run"
+    rm -f "$tmp" "$vout"
+    return 1
+  fi
+  wait "$vpid"
+  local vstatus=$?
+  if [ "$vstatus" -eq 0 ]; then
     install -m 0440 -o root -g wheel "$tmp" "$marker"
-    rm -f "$tmp"
+    rm -f "$tmp" "$vout"
     log "passwordless sudo for admin group installed at $marker"
     return 0
   fi
-  rm -f "$tmp"
-  log "ERROR: generated sudoers snippet failed visudo syntax check, not installing"
+  log "ERROR: generated sudoers snippet failed visudo syntax check: $(cat "$vout" 2>/dev/null)"
+  rm -f "$tmp" "$vout"
   return 1
 }
 
