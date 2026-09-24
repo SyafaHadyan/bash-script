@@ -967,15 +967,20 @@ install() {
 PLIST
   chmod 644 "$PLIST_PATH"
 
-  # Re-bootstrapping/loading an already-loaded job is exactly what throws
-  # launchd's cryptic "5: Input/output error" - check first instead of
-  # trying and swallowing the error, so re-running install/update on a
-  # machine where the daemon is still active doesn't print a scary but
-  # harmless message.
-  if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
+  # RunAtLoad=true means bootstrap already triggers the first run on its
+  # own the moment the job is loaded - calling kickstart -k right after a
+  # *fresh* bootstrap races that automatic launch and can leave two
+  # run_steps() processes alive at once (this was the actual cause of
+  # every log line appearing duplicated, not a visudo hang). Only kickstart
+  # when the job was already loaded from a previous run, where RunAtLoad
+  # won't fire again on its own and an explicit kick is genuinely needed.
+  # Re-bootstrapping/loading an already-loaded job is also what throws
+  # launchd's cryptic "5: Input/output error", so this check avoids that too.
+  if launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
+  else
     launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || launchctl load -w "$PLIST_PATH" 2>/dev/null
   fi
-  launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
   log "installed at $SCRIPT_INSTALL_PATH, daemon registered and started"
 }
 
