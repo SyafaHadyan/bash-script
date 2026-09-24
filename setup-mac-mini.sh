@@ -33,7 +33,14 @@
 #   8. Install Homebrew for General (a general-purpose dependency for future
 #      steps). Install Android Studio directly from Google's DMG (not via
 #      Homebrew cask, which has had compatibility bugs on very new macOS
-#      versions).
+#      versions), pre-configured to skip sending usage statistics. The
+#      first-run setup wizard itself is not suppressed - a person still
+#      clicks through it once at the monitor. Clean up General's Dock down
+#      to just Finder/Launchpad/Android Studio/Terminal and remove all
+#      widgets/stacks (via dockutil). Install Tailscale (Homebrew cask) last
+#      and add it as a login item so it launches automatically - the actual
+#      "connect this device" login is deliberately not automated, do that
+#      manually at the monitor.
 #
 # Other subcommands:
 #   update     re-copy an updated script and (re-)register the daemon;
@@ -91,7 +98,7 @@ LAB_PASS="12345"
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SWITCH_TO_GENERAL SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO)
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SWITCH_TO_GENERAL SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO DOCK_CLEANUP TAILSCALE)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -462,6 +469,49 @@ configure_brew_shellenv_for_user() {
   sudo -u "$user" /usr/bin/env bash -c "printf '%s\n' '$line' >> '$profile'"
 }
 
+tailscale_installed() {
+  [ -d "/Applications/Tailscale.app" ]
+}
+
+install_tailscale_for_user() {
+  local user="$1"
+  if tailscale_installed; then
+    log "Tailscale already installed"
+    return 0
+  fi
+  set_phase "installing Tailscale"
+  sudo -u "$user" "$BREW_PREFIX/bin/brew" install --cask tailscale 2>&1 | tee -a "$LOG_FILE"
+  if tailscale_installed; then
+    log "Tailscale installed"
+    return 0
+  fi
+  log "ERROR: Tailscale.app not found in /Applications after brew install"
+  return 1
+}
+
+tailscale_login_item_enabled() {
+  sudo -u "$1" osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null |
+    grep -qi "Tailscale"
+}
+
+enable_tailscale_launch_at_login() {
+  local user="$1"
+  if tailscale_login_item_enabled "$user"; then
+    log "Tailscale already set to launch at login for $user"
+    return
+  fi
+  log "adding Tailscale as a login item for $user"
+  sudo -u "$user" osascript -e \
+    'tell application "System Events" to make login item at end with properties {path:"/Applications/Tailscale.app", hidden:false}' \
+    >/dev/null 2>&1
+  # Connecting the device itself (tailscale up / signing into an identity
+  # provider) needs a human at the GUI regardless - deliberately not
+  # automated here, do that manually. macOS may also prompt for a one-time
+  # System Settings > Network Extension approval on Tailscale's first
+  # launch, same class of manual step as approving any VPN/network
+  # extension app for the first time.
+}
+
 android_studio_installed() {
   [ -d "/Applications/Android Studio.app" ]
 }
@@ -532,6 +582,92 @@ install_android_studio() {
     return 0
   fi
   log "ERROR: Android Studio.app not found in /Applications after copy"
+  return 1
+}
+
+android_studio_usage_stats_opted_out() {
+  local home
+  home=$(dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -z "$home" ] && home="/Users/$1"
+  grep -q "rsch.send.usage.stat:[0-9.]*:0:" "$home/Library/Application Support/Google/consentOptions/accepted" 2>/dev/null
+}
+
+configure_android_studio_no_usage_stats() {
+  local user="$1" home
+  if android_studio_usage_stats_opted_out "$user"; then
+    log "Android Studio usage-statistics opt-out already configured for $user"
+    return
+  fi
+  home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+  [ -z "$home" ] && home="/Users/$user"
+  log "opting $user out of Android Studio usage statistics"
+  # JetBrains-platform apps (Android Studio included) store this consent
+  # decision as a semicolon-separated ConfirmedConsent list at
+  # consentOptions/accepted under the vendor's shared app-config directory
+  # ("Google" here, not versioned per-release) - confirmed against
+  # JetBrains' own ConsentOptions.java source. "rsch.send.usage.stat" (no
+  # trailing s) is the actual consent ID used there; entry format is
+  # id:version:accepted(0|1):timestamp-ms. Pre-seeding this file before
+  # first launch means the IDE sees a decision already on record and skips
+  # asking.
+  local consent_dir="$home/Library/Application Support/Google/consentOptions"
+  local ts
+  ts="$(date +%s)000"
+  sudo -u "$user" mkdir -p "$consent_dir"
+  sudo -u "$user" /usr/bin/env bash -c "printf '%s' 'rsch.send.usage.stat:1.1:0:$ts' > '$consent_dir/accepted'"
+}
+
+dockutil_installed_for_user() {
+  sudo -u "$1" test -x "$BREW_PREFIX/bin/dockutil"
+}
+
+install_dockutil_for_user() {
+  local user="$1"
+  if dockutil_installed_for_user "$user"; then
+    return 0
+  fi
+  sudo -u "$user" "$BREW_PREFIX/bin/brew" install dockutil 2>&1 | tee -a "$LOG_FILE"
+  dockutil_installed_for_user "$user"
+}
+
+# Finder isn't a persistent-apps entry at all (it's a fixed tile dockutil
+# doesn't touch), so the kept set here only needs to name the other three.
+dock_cleaned_up() {
+  local user="$1" names extra
+  names=$(sudo -u "$user" "$BREW_PREFIX/bin/dockutil" --list 2>/dev/null | cut -f1)
+  [ -z "$names" ] && return 1
+  echo "$names" | grep -qx "Launchpad" || return 1
+  echo "$names" | grep -qx "Android Studio" || return 1
+  echo "$names" | grep -qx "Terminal" || return 1
+  extra=$(echo "$names" | grep -vxE 'Launchpad|Android Studio|Terminal')
+  [ -z "$extra" ]
+}
+
+configure_dock_for_user() {
+  local user="$1" dockutil="$BREW_PREFIX/bin/dockutil"
+  if ! install_dockutil_for_user "$user"; then
+    log "ERROR: failed to install dockutil for $user"
+    return 1
+  fi
+  if dock_cleaned_up "$user"; then
+    log "Dock already cleaned up for $user (Finder/Launchpad/Android Studio/Terminal only, no widgets)"
+    return 0
+  fi
+  log "cleaning up Dock for $user: unpinning everything except Finder/Launchpad/Android Studio/Terminal, removing widgets"
+  # dockutil's "all" clears the whole dock plist in one go - both the
+  # left-side pinned-apps section and the right-side folders/stacks/widgets
+  # section - so this single call covers "remove all widgets" too, not just
+  # the app icons.
+  sudo -u "$user" "$dockutil" --remove all --no-restart
+  sudo -u "$user" "$dockutil" --add '/System/Applications/Launchpad.app' --no-restart
+  sudo -u "$user" "$dockutil" --add '/Applications/Android Studio.app' --no-restart
+  sudo -u "$user" "$dockutil" --add '/System/Applications/Utilities/Terminal.app' --no-restart
+  sudo -u "$user" killall Dock >/dev/null 2>&1
+  if dock_cleaned_up "$user"; then
+    log "Dock cleaned up for $user"
+    return 0
+  fi
+  log "ERROR: Dock cleanup for $user did not verify cleanly"
   return 1
 }
 
@@ -786,6 +922,18 @@ check_state() {
     check_line ANDROID_STUDIO 0 "not satisfied"
   fi
 
+  if dock_cleaned_up "$GENERAL_USER"; then
+    check_line DOCK_CLEANUP 1 "confirmed"
+  else
+    check_line DOCK_CLEANUP 0 "not satisfied"
+  fi
+
+  if tailscale_installed; then
+    check_line TAILSCALE 1 "confirmed"
+  else
+    check_line TAILSCALE 0 "not satisfied"
+  fi
+
   echo
   if [ "$CHECK_MISMATCHES" -eq 0 ]; then
     echo "no mismatches - marker state matches live system state for every checked step"
@@ -863,6 +1011,14 @@ reconcile_state() {
   if ! is_done ANDROID_STUDIO && android_studio_installed; then
     log "reconcile: Android Studio already installed, backfilling ANDROID_STUDIO"
     mark_done ANDROID_STUDIO
+  fi
+  if ! is_done DOCK_CLEANUP && dock_cleaned_up "$GENERAL_USER"; then
+    log "reconcile: Dock already cleaned up for $GENERAL_USER, backfilling DOCK_CLEANUP"
+    mark_done DOCK_CLEANUP
+  fi
+  if ! is_done TAILSCALE && tailscale_installed; then
+    log "reconcile: Tailscale already installed, backfilling TAILSCALE"
+    mark_done TAILSCALE
   fi
 }
 
@@ -983,10 +1139,34 @@ run_steps() {
   fi
 
   if ! is_done ANDROID_STUDIO; then
-    if install_android_studio; then
-      mark_done ANDROID_STUDIO
-    else
-      log "WARNING: Android Studio installation did not succeed, will retry next run"
+    if require_done GENERAL_CREATED; then
+      if install_android_studio; then
+        configure_android_studio_no_usage_stats "$GENERAL_USER"
+        mark_done ANDROID_STUDIO
+      else
+        log "WARNING: Android Studio installation did not succeed, will retry next run"
+      fi
+    fi
+  fi
+
+  if ! is_done DOCK_CLEANUP; then
+    if require_done ANDROID_STUDIO; then
+      if configure_dock_for_user "$GENERAL_USER"; then
+        mark_done DOCK_CLEANUP
+      else
+        log "WARNING: Dock cleanup for $GENERAL_USER did not succeed, will retry next run"
+      fi
+    fi
+  fi
+
+  if ! is_done TAILSCALE; then
+    if require_done HOMEBREW; then
+      if install_tailscale_for_user "$GENERAL_USER"; then
+        enable_tailscale_launch_at_login "$GENERAL_USER"
+        mark_done TAILSCALE
+      else
+        log "WARNING: Tailscale installation did not succeed, will retry next run"
+      fi
     fi
   fi
 
