@@ -21,8 +21,14 @@
 #      General can't authorize OS installs at all), disable FileVault
 #      (required for auto-login to work at all), configure auto-login as
 #      General.
-#   3. Apply the same appearance/mouse/lock-screen prefs to General.
-#   4. Print a large completion banner.
+#   3. Pre-seed SetupAssistant markers so General's first-ever login skips
+#      the welcome/onboarding screens (Apple ID, Siri, Analytics, etc.), and
+#      apply the same appearance/mouse/lock-screen prefs to General.
+#   4. Print a large completion banner, then log out of Lab so auto-login
+#      brings up General for the first time - deliberately after step 3,
+#      not before it, since that's what actually triggers General's first
+#      login and the onboarding-suppression markers need to already be in
+#      place by then.
 #   5. Wait for internet, then upgrade macOS to the latest available major
 #      version (falls back to ordinary updates if already current),
 #      restarting automatically as part of that.
@@ -101,7 +107,7 @@ LAB_PASS="12345"
 # is tracked per-name (a marker file per step), not by position in this
 # list, so a new step can be inserted or appended anywhere later without
 # affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SWITCH_TO_GENERAL SETUP_ASSISTANT GENERAL_PREFS BANNER OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO TAILSCALE DOCK_CLEANUP)
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SETUP_ASSISTANT GENERAL_PREFS BANNER SWITCH_TO_GENERAL OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO TAILSCALE DOCK_CLEANUP)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -916,12 +922,6 @@ check_state() {
     check_line SUDO_NOPASSWD 0 "not satisfied"
   fi
 
-  if [ "$console_user" = "$GENERAL_USER" ]; then
-    check_line SWITCH_TO_GENERAL 1 "confirmed ($GENERAL_USER is active session)"
-  else
-    check_line SWITCH_TO_GENERAL 0 "not satisfied (active session: $console_user)"
-  fi
-
   if setup_assistant_suppressed "$GENERAL_USER"; then
     check_line SETUP_ASSISTANT 1 "confirmed"
   else
@@ -937,6 +937,12 @@ check_state() {
   local banner_marker="pending"
   is_done BANNER && banner_marker="done"
   printf "  %-18s marker=%-8s live=%s\n" "BANNER" "$banner_marker" "(no live check available)"
+
+  if [ "$console_user" = "$GENERAL_USER" ]; then
+    check_line SWITCH_TO_GENERAL 1 "confirmed ($GENERAL_USER is active session)"
+  else
+    check_line SWITCH_TO_GENERAL 0 "not satisfied (active session: $console_user)"
+  fi
 
   if ! os_update_pending; then
     check_line OS_UPDATE 1 "confirmed (no update pending)"
@@ -1028,10 +1034,6 @@ reconcile_state() {
     log "reconcile: admin NOPASSWD rule already present, backfilling SUDO_NOPASSWD"
     mark_done SUDO_NOPASSWD
   fi
-  if ! is_done SWITCH_TO_GENERAL && [ "$(stat -f%Su /dev/console 2>/dev/null)" = "$GENERAL_USER" ]; then
-    log "reconcile: $GENERAL_USER is already the active session, backfilling SWITCH_TO_GENERAL"
-    mark_done SWITCH_TO_GENERAL
-  fi
   if ! is_done SETUP_ASSISTANT && setup_assistant_suppressed "$GENERAL_USER"; then
     log "reconcile: SetupAssistant markers already present for $GENERAL_USER, backfilling SETUP_ASSISTANT"
     mark_done SETUP_ASSISTANT
@@ -1039,6 +1041,10 @@ reconcile_state() {
   if ! is_done GENERAL_PREFS && user_prefs_applied "$GENERAL_USER"; then
     log "reconcile: appearance/mouse prefs already applied to $GENERAL_USER, backfilling GENERAL_PREFS"
     mark_done GENERAL_PREFS
+  fi
+  if ! is_done SWITCH_TO_GENERAL && [ "$(stat -f%Su /dev/console 2>/dev/null)" = "$GENERAL_USER" ]; then
+    log "reconcile: $GENERAL_USER is already the active session, backfilling SWITCH_TO_GENERAL"
+    mark_done SWITCH_TO_GENERAL
   fi
   if ! is_done OS_UPDATE && ! os_update_pending; then
     log "reconcile: no macOS update pending, backfilling OS_UPDATE"
@@ -1130,13 +1136,6 @@ run_steps() {
     fi
   fi
 
-  if ! is_done SWITCH_TO_GENERAL; then
-    if require_done GENERAL_CREATED; then
-      switch_to_general
-      mark_done SWITCH_TO_GENERAL
-    fi
-  fi
-
   if ! is_done SETUP_ASSISTANT; then
     if require_done GENERAL_CREATED; then
       suppress_first_login_setup_assistant "$GENERAL_USER"
@@ -1154,6 +1153,18 @@ run_steps() {
   if ! is_done BANNER; then
     banner
     mark_done BANNER
+  fi
+
+  if ! is_done SWITCH_TO_GENERAL; then
+    # Must come after SETUP_ASSISTANT specifically - this is what actually
+    # triggers General's first-ever login (via logout + auto-login), so the
+    # welcome-screen suppression markers need to already be in place before
+    # this runs, not after. Running this first was the actual cause of the
+    # onboarding screens not being suppressed on first login.
+    if require_done GENERAL_CREATED && require_done SETUP_ASSISTANT; then
+      switch_to_general
+      mark_done SWITCH_TO_GENERAL
+    fi
   fi
 
   if ! is_done OS_UPDATE; then
