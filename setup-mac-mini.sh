@@ -399,7 +399,7 @@ upgrade_macos() {
       # A Secure Token alone doesn't tell startosinstall which account to
       # authenticate as - without --user/--stdinpass it falls back to an
       # interactive password prompt, which hangs forever with no TTY here.
-      printf '%s' "$GENERAL_PASS" | "$installer_app/Contents/Resources/startosinstall" \
+      printf '%s\n' "$GENERAL_PASS" | "$installer_app/Contents/Resources/startosinstall" \
         --agreetolicense --nointeraction --restart \
         --user "$GENERAL_USER" --stdinpass \
         2>&1 | tee -a "$LOG_FILE"
@@ -832,7 +832,14 @@ install() {
 PLIST
   chmod 644 "$PLIST_PATH"
 
-  launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || launchctl load -w "$PLIST_PATH"
+  # Re-bootstrapping/loading an already-loaded job is exactly what throws
+  # launchd's cryptic "5: Input/output error" - check first instead of
+  # trying and swallowing the error, so re-running install/update on a
+  # machine where the daemon is still active doesn't print a scary but
+  # harmless message.
+  if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
+    launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || launchctl load -w "$PLIST_PATH" 2>/dev/null
+  fi
   launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
   log "installed at $SCRIPT_INSTALL_PATH, daemon registered and started"
 }
