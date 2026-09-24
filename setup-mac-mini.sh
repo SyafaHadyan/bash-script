@@ -30,7 +30,10 @@
 #      connected"; there is no literal laptop-style AC-power-on toggle.
 #   7. Enable Remote Login (SSH) and Remote Management/Screen Sharing
 #      (access granted to General).
-#   8. Install Homebrew (if missing) and Android Studio for General.
+#   8. Install Homebrew for General (a general-purpose dependency for future
+#      steps). Install Android Studio directly from Google's DMG (not via
+#      Homebrew cask, which has had compatibility bugs on very new macOS
+#      versions).
 #
 # Other subcommands:
 #   update     re-copy an updated script and (re-)register the daemon;
@@ -459,14 +462,77 @@ configure_brew_shellenv_for_user() {
   sudo -u "$user" /usr/bin/env bash -c "printf '%s\n' '$line' >> '$profile'"
 }
 
-install_android_studio_for_user() {
-  local user="$1"
-  if sudo -u "$user" test -d "/Applications/Android Studio.app"; then
+android_studio_installed() {
+  [ -d "/Applications/Android Studio.app" ]
+}
+
+install_android_studio() {
+  if android_studio_installed; then
     log "Android Studio already installed"
-    return
+    return 0
   fi
-  set_phase "installing Android Studio via Homebrew cask for $user"
-  sudo -u "$user" "$BREW_PREFIX/bin/brew" install --cask android-studio 2>&1 | tee -a "$LOG_FILE"
+  set_phase "downloading Android Studio installer"
+
+  # Homebrew's cask API is unusable on some very new macOS versions (a bug
+  # in Homebrew itself, confirmed via plain `brew info`/`brew search`
+  # failing identically with no cask install involved at all) - installing
+  # directly from Google's own DMG sidesteps Homebrew entirely.
+  local arch_suffix
+  if [ "$(uname -m)" = "arm64" ]; then
+    arch_suffix='-mac_arm\.dmg'
+  else
+    arch_suffix='-mac\.dmg'
+  fi
+
+  # Google only publishes version-pinned download URLs, no stable/versionless
+  # redirect exists - scrape the current version's link fresh each run
+  # instead of hardcoding a version that will eventually 404.
+  local dmg_url
+  dmg_url=$(curl -fsSL https://developer.android.com/studio 2>/dev/null |
+    grep -oE "https://edgedl\.me\.gvt1\.com/android/studio/install/[^\"]+${arch_suffix}" |
+    head -1)
+  if [ -z "$dmg_url" ]; then
+    log "ERROR: could not find current Android Studio download URL on developer.android.com/studio"
+    return 1
+  fi
+
+  local tmp_dmg
+  tmp_dmg="$(mktemp -t android-studio).dmg"
+  log "downloading Android Studio from $dmg_url"
+  if ! curl -fsSL "$dmg_url" -o "$tmp_dmg"; then
+    log "ERROR: failed to download Android Studio DMG"
+    rm -f "$tmp_dmg"
+    return 1
+  fi
+
+  set_phase "installing Android Studio"
+  local mount_point
+  mount_point=$(hdiutil attach -nobrowse "$tmp_dmg" 2>&1 | grep -o '/Volumes/.*' | tail -1)
+  if [ -z "$mount_point" ] || [ ! -d "$mount_point" ]; then
+    log "ERROR: failed to mount Android Studio DMG"
+    rm -f "$tmp_dmg"
+    return 1
+  fi
+
+  local app_src
+  app_src=$(ls -d "$mount_point"/*.app 2>/dev/null | head -1)
+  if [ -z "$app_src" ]; then
+    log "ERROR: no .app bundle found in mounted Android Studio DMG"
+    hdiutil detach -quiet "$mount_point" >/dev/null 2>&1
+    rm -f "$tmp_dmg"
+    return 1
+  fi
+
+  cp -R "$app_src" "/Applications/"
+  hdiutil detach -quiet "$mount_point" >/dev/null 2>&1
+  rm -f "$tmp_dmg"
+
+  if android_studio_installed; then
+    log "Android Studio installed to /Applications"
+    return 0
+  fi
+  log "ERROR: Android Studio.app not found in /Applications after copy"
+  return 1
 }
 
 configure_power_on_ac() {
@@ -609,10 +675,6 @@ homebrew_installed_for_user() {
   sudo -u "$1" test -x "$BREW_PREFIX/bin/brew"
 }
 
-android_studio_installed_for_user() {
-  sudo -u "$1" test -d "/Applications/Android Studio.app"
-}
-
 CHECK_MISMATCHES=0
 
 # Prints one integrity-check line and flags a mismatch either direction:
@@ -718,7 +780,7 @@ check_state() {
     check_line HOMEBREW 0 "not satisfied"
   fi
 
-  if android_studio_installed_for_user "$GENERAL_USER"; then
+  if android_studio_installed; then
     check_line ANDROID_STUDIO 1 "confirmed"
   else
     check_line ANDROID_STUDIO 0 "not satisfied"
@@ -798,7 +860,7 @@ reconcile_state() {
     log "reconcile: Homebrew already installed for $GENERAL_USER, backfilling HOMEBREW"
     mark_done HOMEBREW
   fi
-  if ! is_done ANDROID_STUDIO && android_studio_installed_for_user "$GENERAL_USER"; then
+  if ! is_done ANDROID_STUDIO && android_studio_installed; then
     log "reconcile: Android Studio already installed, backfilling ANDROID_STUDIO"
     mark_done ANDROID_STUDIO
   fi
@@ -921,13 +983,10 @@ run_steps() {
   fi
 
   if ! is_done ANDROID_STUDIO; then
-    if require_done HOMEBREW; then
-      install_android_studio_for_user "$GENERAL_USER"
-      if android_studio_installed_for_user "$GENERAL_USER"; then
-        mark_done ANDROID_STUDIO
-      else
-        log "WARNING: Android Studio installation for $GENERAL_USER did not succeed, will retry next run"
-      fi
+    if install_android_studio; then
+      mark_done ANDROID_STUDIO
+    else
+      log "WARNING: Android Studio installation did not succeed, will retry next run"
     fi
   fi
 
