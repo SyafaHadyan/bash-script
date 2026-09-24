@@ -399,8 +399,12 @@ upgrade_macos() {
       # A Secure Token alone doesn't tell startosinstall which account to
       # authenticate as - without --user/--stdinpass it falls back to an
       # interactive password prompt, which hangs forever with no TTY here.
+      # No --restart flag: unlike softwareupdate, startosinstall has no such
+      # option (some macOS/startosinstall versions reject it outright) - it
+      # reboots into the installer environment automatically once staged,
+      # that part was never optional to begin with.
       printf '%s\n' "$GENERAL_PASS" | "$installer_app/Contents/Resources/startosinstall" \
-        --agreetolicense --nointeraction --restart \
+        --agreetolicense --nointeraction \
         --user "$GENERAL_USER" --stdinpass \
         2>&1 | tee -a "$LOG_FILE"
       exit 0
@@ -603,6 +607,125 @@ homebrew_installed_for_user() {
 
 android_studio_installed_for_user() {
   sudo -u "$1" test -d "/Applications/Android Studio.app"
+}
+
+CHECK_MISMATCHES=0
+
+# Prints one integrity-check line and flags a mismatch either direction:
+# marked done but live check disagrees (the concerning case - something
+# claims to be finished but isn't), or not marked done but already true live
+# (harmless - reconcile_state would backfill this on the next real run).
+check_line() {
+  local step="$1" live_ok="$2" live_desc="$3"
+  local marker="pending"
+  is_done "$step" && marker="done"
+  local note=""
+  if [ "$marker" = "done" ] && [ "$live_ok" = "0" ]; then
+    note=" <-- MISMATCH: marked done but live check disagrees"
+    CHECK_MISMATCHES=$((CHECK_MISMATCHES + 1))
+  elif [ "$marker" = "pending" ] && [ "$live_ok" = "1" ]; then
+    note=" <-- mismatch: already satisfied live, marker not set (self-heals on next run)"
+    CHECK_MISMATCHES=$((CHECK_MISMATCHES + 1))
+  fi
+  printf "  %-18s marker=%-8s live=%s%s\n" "$step" "$marker" "$live_desc" "$note"
+}
+
+# Read-only: unlike reconcile_state, never touches any marker - just reports
+# where the marker file and live system state actually agree or disagree.
+check_state() {
+  echo "integrity check:"
+  local labuser console_user
+  labuser=$(find_lab_user)
+  console_user=$(stat -f%Su /dev/console 2>/dev/null)
+
+  if [ -n "$labuser" ] && user_prefs_applied "$labuser"; then
+    check_line LAB_PREFS 1 "confirmed"
+  else
+    check_line LAB_PREFS 0 "not satisfied"
+  fi
+
+  if general_account_exists; then
+    check_line GENERAL_CREATED 1 "confirmed"
+  else
+    check_line GENERAL_CREATED 0 "not satisfied"
+  fi
+
+  if has_secure_token "$GENERAL_USER"; then
+    check_line SECURE_TOKEN 1 "confirmed"
+  else
+    check_line SECURE_TOKEN 0 "not satisfied"
+  fi
+
+  if admin_nopasswd_present; then
+    check_line SUDO_NOPASSWD 1 "confirmed"
+  else
+    check_line SUDO_NOPASSWD 0 "not satisfied"
+  fi
+
+  if [ "$console_user" = "$GENERAL_USER" ]; then
+    check_line SWITCH_TO_GENERAL 1 "confirmed ($GENERAL_USER is active session)"
+  else
+    check_line SWITCH_TO_GENERAL 0 "not satisfied (active session: $console_user)"
+  fi
+
+  if setup_assistant_suppressed "$GENERAL_USER"; then
+    check_line SETUP_ASSISTANT 1 "confirmed"
+  else
+    check_line SETUP_ASSISTANT 0 "not satisfied"
+  fi
+
+  if user_prefs_applied "$GENERAL_USER"; then
+    check_line GENERAL_PREFS 1 "confirmed"
+  else
+    check_line GENERAL_PREFS 0 "not satisfied"
+  fi
+
+  local banner_marker="pending"
+  is_done BANNER && banner_marker="done"
+  printf "  %-18s marker=%-8s live=%s\n" "BANNER" "$banner_marker" "(no live check available)"
+
+  if ! os_update_pending; then
+    check_line OS_UPDATE 1 "confirmed (no update pending)"
+  else
+    check_line OS_UPDATE 0 "update still pending"
+  fi
+
+  if power_autorestart_enabled; then
+    check_line POWER_CONFIG 1 "confirmed"
+  else
+    check_line POWER_CONFIG 0 "not satisfied"
+  fi
+
+  if remote_login_enabled; then
+    check_line SSH_ENABLED 1 "confirmed"
+  else
+    check_line SSH_ENABLED 0 "not satisfied"
+  fi
+
+  if remote_management_enabled; then
+    check_line REMOTE_DESKTOP 1 "confirmed (best-effort check)"
+  else
+    check_line REMOTE_DESKTOP 0 "not satisfied (best-effort check)"
+  fi
+
+  if homebrew_installed_for_user "$GENERAL_USER"; then
+    check_line HOMEBREW 1 "confirmed"
+  else
+    check_line HOMEBREW 0 "not satisfied"
+  fi
+
+  if android_studio_installed_for_user "$GENERAL_USER"; then
+    check_line ANDROID_STUDIO 1 "confirmed"
+  else
+    check_line ANDROID_STUDIO 0 "not satisfied"
+  fi
+
+  echo
+  if [ "$CHECK_MISMATCHES" -eq 0 ]; then
+    echo "no mismatches - marker state matches live system state for every checked step"
+  else
+    echo "$CHECK_MISMATCHES mismatch(es) found - run 'update' to reconcile automatically, or investigate manually"
+  fi
 }
 
 # Runs before the main step sequence on every pass. A step's marker file is
@@ -861,6 +984,8 @@ Usage: sudo bash $0 <command>
              that's already partway through or fully finished
   run        run one pass of the state machine (used by the daemon)
   status     show which steps are done/pending and recent log output
+  check      integrity check - compare marker files against live system
+             state for every step and flag any mismatch, read-only
   reset      forget all progress (start over, e.g. for a new Mac Mini)
   uninstall  remove the LaunchDaemon (progress markers are left untouched)
 EOF
@@ -888,6 +1013,10 @@ status)
   done
   echo "---- last 40 log lines ----"
   tail -n 40 "$LOG_FILE" 2>/dev/null
+  ;;
+check)
+  need_root
+  check_state
   ;;
 reset)
   need_root
