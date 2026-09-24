@@ -13,14 +13,15 @@
 # then removes its own LaunchDaemon.
 #
 # Steps performed, in order, each skipped if already done:
-#   1. Detect the existing "Lab Pembelajaran N" account, set dark mode,
-#      max mouse tracking speed, and non-inverted scrolling for it.
+#   1. Detect the existing "Lab Pembelajaran N" account, set dark mode, max
+#      mouse tracking speed, non-inverted scrolling, and disable the
+#      lock/password screen after sleep or screensaver for it.
 #   2. Create an admin account "General" (password 123456789), grant it a
 #      Secure Token (via the Lab account's credentials - without this,
 #      General can't authorize OS installs at all), disable FileVault
 #      (required for auto-login to work at all), configure auto-login as
 #      General.
-#   3. Apply the same appearance/mouse prefs to General.
+#   3. Apply the same appearance/mouse/lock-screen prefs to General.
 #   4. Print a large completion banner.
 #   5. Wait for internet, then upgrade macOS to the latest available major
 #      version (falls back to ordinary updates if already current),
@@ -191,6 +192,19 @@ set_mouse_not_inverted() {
   sudo -u "$1" defaults -currentHost write NSGlobalDomain com.apple.swipescrolldirection -bool false
 }
 
+disable_screen_lock() {
+  local user="$1"
+  # askForPassword governs the lock prompt after both screensaver AND sleep
+  # wake (one shared setting for both) - disabling it means even if the
+  # screensaver or a sleep cycle happens, the session comes back straight to
+  # the desktop instead of a login/unlock screen. idleTime 0 additionally
+  # stops the screensaver from ever kicking in at all (ByHost, same as mouse
+  # settings above), which also avoids it being visible on the monitor.
+  sudo -u "$user" defaults write com.apple.screensaver askForPassword -int 0
+  sudo -u "$user" defaults write com.apple.screensaver askForPasswordDelay -int 0
+  sudo -u "$user" defaults -currentHost write com.apple.screensaver idleTime -int 0
+}
+
 # Nudges an already-running session to actually reflect prefs just written
 # to disk. Only meaningful when $user is the currently active console user
 # (e.g. Lab, since it's live while this script runs) - a brand new account's
@@ -209,10 +223,11 @@ live_refresh_user_prefs() {
 
 apply_user_prefs() {
   local user="$1"
-  log "applying appearance/mouse prefs to $user"
+  log "applying appearance/mouse/lock-screen prefs to $user"
   set_dark_mode "$user"
   set_mouse_sensitivity_max "$user"
   set_mouse_not_inverted "$user"
+  disable_screen_lock "$user"
   live_refresh_user_prefs "$user"
 }
 
@@ -808,12 +823,14 @@ setup_assistant_suppressed() {
 }
 
 user_prefs_applied() {
-  local user="$1" style scroll scaling
+  local user="$1" style scroll scaling lock_pref
   style=$(sudo -u "$user" defaults read NSGlobalDomain AppleInterfaceStyle 2>/dev/null)
   scroll=$(sudo -u "$user" defaults read NSGlobalDomain com.apple.swipescrolldirection 2>/dev/null)
   scaling=$(sudo -u "$user" defaults read NSGlobalDomain com.apple.mouse.scaling 2>/dev/null)
+  lock_pref=$(sudo -u "$user" defaults read com.apple.screensaver askForPassword 2>/dev/null)
   [ "$style" = "Dark" ] || return 1
   [ "$scroll" = "0" ] || return 1
+  [ "$lock_pref" = "0" ] || return 1
   awk -v v="${scaling:-0}" 'BEGIN{exit !(v+0>=2.9)}'
 }
 
