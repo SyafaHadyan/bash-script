@@ -396,6 +396,15 @@ os_update_pending() {
 
 upgrade_macos() {
   set_phase "checking for available macOS updates"
+  if ! has_secure_token "$GENERAL_USER"; then
+    # A correct password alone isn't enough here - startosinstall's --user
+    # authorizes against the boot volume, which macOS refuses for any
+    # account without a Secure Token, and fails with a generic "failed to
+    # authenticate" that looks identical to a wrong password. Bail out early
+    # rather than let that misleading error surface downstream.
+    log "ERROR: $GENERAL_USER lacks a Secure Token, cannot authorize this install yet - will retry once SECURE_TOKEN completes"
+    return 1
+  fi
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
   latest_version=$(softwareupdate --list-full-installers 2>/dev/null |
@@ -678,13 +687,8 @@ configure_power_on_ac() {
 
 configure_passwordless_sudo_for_admin() {
   local marker="/etc/sudoers.d/99-admin-nopasswd"
-  if [ -f "$marker" ]; then
-    log "passwordless sudo for admin already configured (marker file present)"
-    return 0
-  fi
-  if grep -RqsE '^[[:space:]]*%admin[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL' \
-    /etc/sudoers /etc/sudoers.d/ 2>/dev/null; then
-    log "an existing %admin NOPASSWD rule already exists in sudoers config, skipping"
+  if admin_nopasswd_present; then
+    log "passwordless sudo for admin already configured"
     return 0
   fi
   log "adding passwordless sudo for admin group"
@@ -697,13 +701,27 @@ configure_passwordless_sudo_for_admin() {
   # known-valid sudoers line, not built from any variable or untrusted
   # input, so there's nothing an external syntax check would actually catch.
   # Write it directly with the permissions sudoers.d requires.
+  mkdir -p "$(dirname "$marker")"
   local tmp
   tmp=$(mktemp)
   echo "%admin ALL=(ALL) NOPASSWD: ALL" >"$tmp"
-  install -m 0440 -o root -g wheel "$tmp" "$marker"
+  if ! install -m 0440 -o root -g wheel "$tmp" "$marker"; then
+    log "ERROR: failed to write sudoers drop-in at $marker"
+    rm -f "$tmp"
+    return 1
+  fi
   rm -f "$tmp"
-  log "passwordless sudo for admin group installed at $marker"
-  return 0
+  # Verify against live content afterward instead of trusting the write
+  # unconditionally - a previous version of this function always returned 0
+  # here regardless of whether install actually succeeded, which is exactly
+  # how this step could get silently marked done despite nothing actually
+  # being in place.
+  if admin_nopasswd_present; then
+    log "passwordless sudo for admin group installed at $marker"
+    return 0
+  fi
+  log "ERROR: wrote $marker but the rule still doesn't verify - check the file's content/permissions, and confirm /etc/sudoers actually has a '#includedir /private/etc/sudoers.d' line on this machine"
+  return 1
 }
 
 enable_remote_login() {
@@ -773,9 +791,15 @@ general_account_exists() {
   dscl . -list /Users 2>/dev/null | grep -qx "$GENERAL_USER"
 }
 
+# Always a live content check against the actual sudoers config, never a
+# "does our marker file merely exist" shortcut - that shortcut is exactly
+# what let this step get stuck reporting "not done" even after a valid rule
+# was added by hand elsewhere (e.g. directly in /etc/sudoers), since a
+# manual fix never creates our marker file at all. Whitespace around "="
+# is tolerated too, since a hand-edited line won't necessarily match our
+# own script's exact formatting.
 admin_nopasswd_present() {
-  [ -f "/etc/sudoers.d/99-admin-nopasswd" ] && return 0
-  grep -RqsE '^[[:space:]]*%admin[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL' \
+  grep -RqsE '^[[:space:]]*%admin[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]*ALL' \
     /etc/sudoers /etc/sudoers.d/ 2>/dev/null
 }
 
@@ -1032,6 +1056,16 @@ run_steps() {
   trap release_lock EXIT
   log "=== run started ==="
   reconcile_state
+  # Unconditional and up front, not scoped to OS_UPDATE - HOMEBREW, Android
+  # Studio's DMG download, and TAILSCALE/dockutil all curl/brew-install
+  # something too, and used to only work by accident because OS_UPDATE ran
+  # right before them and always called this first. Once OS_UPDATE grew its
+  # own require_done gate, anything gated behind that (e.g. SECURE_TOKEN not
+  # done yet) would skip straight past this call, leaving later steps to hit
+  # a boot where the network genuinely isn't up yet and fail silently every
+  # pass. wait_for_internet itself is cheap to call redundantly - it exits
+  # immediately if already connected.
+  wait_for_internet
 
   if ! is_done LAB_PREFS; then
     local labuser
@@ -1095,17 +1129,18 @@ run_steps() {
   fi
 
   if ! is_done OS_UPDATE; then
-    wait_for_internet
-    if os_update_pending; then
-      upgrade_macos
-      # only reaches here if upgrade_macos didn't need to trigger its own
-      # reboot (e.g. it found nothing left to do after all); re-check below
-      # rather than assuming that means success.
-    fi
-    if os_update_pending; then
-      log "WARNING: macOS update still appears pending, will retry on next run"
-    else
-      mark_done OS_UPDATE
+    if require_done SECURE_TOKEN; then
+      if os_update_pending; then
+        upgrade_macos
+        # only reaches here if upgrade_macos didn't need to trigger its own
+        # reboot (e.g. it found nothing left to do after all); re-check below
+        # rather than assuming that means success.
+      fi
+      if os_update_pending; then
+        log "WARNING: macOS update still appears pending, will retry on next run"
+      else
+        mark_done OS_UPDATE
+      fi
     fi
   fi
 
@@ -1150,7 +1185,12 @@ run_steps() {
   fi
 
   if ! is_done DOCK_CLEANUP; then
-    if require_done ANDROID_STUDIO; then
+    # Needs both: ANDROID_STUDIO so there's actually an app to pin, and
+    # HOMEBREW since configure_dock_for_user installs dockutil via brew -
+    # without this second guard, a machine where HOMEBREW got skipped would
+    # have this step fail every single run with no obvious cause (brew
+    # simply not existing yet at $BREW_PREFIX), instead of clearly waiting.
+    if require_done ANDROID_STUDIO && require_done HOMEBREW; then
       if configure_dock_for_user "$GENERAL_USER"; then
         mark_done DOCK_CLEANUP
       else
@@ -1261,6 +1301,11 @@ run)
   run_steps
   ;;
 status)
+  # Only reconciles when run as root (reconcile_state shells out as other
+  # users) - a plain non-root status call still works, it just shows
+  # whatever the markers said as of the last real run/reconcile instead of
+  # a fresh live check.
+  [ "$(id -u)" -eq 0 ] && reconcile_state
   echo "admin account name: $GENERAL_USER"
   echo "current phase: $(cat "$PHASE_FILE" 2>/dev/null || echo "idle")"
   echo "steps:"
