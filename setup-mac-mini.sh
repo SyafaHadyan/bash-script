@@ -29,6 +29,7 @@
 #   6. Set "start up automatically when power is restored" (pmset autorestart)
 #      - the closest real equivalent Mac Mini exposes to "power on when AC
 #      connected"; there is no literal laptop-style AC-power-on toggle.
+#      Also disable system/display/disk sleep entirely (pmset sleep 0).
 #   7. Enable Remote Login (SSH) and Remote Management/Screen Sharing
 #      (access granted to General).
 #   8. Install Homebrew for General (a general-purpose dependency for future
@@ -698,6 +699,8 @@ configure_dock_for_user() {
 configure_power_on_ac() {
   log "enabling automatic startup after power is restored (closest Mac equivalent to power-on-when-AC-connected)"
   pmset -a autorestart 1
+  log "disabling system/display/disk sleep so the machine never goes to sleep"
+  pmset -a sleep 0 displaysleep 0 disksleep 0
 }
 
 configure_passwordless_sudo_for_admin() {
@@ -834,8 +837,13 @@ user_prefs_applied() {
   awk -v v="${scaling:-0}" 'BEGIN{exit !(v+0>=2.9)}'
 }
 
-power_autorestart_enabled() {
-  pmset -g | grep -qE 'autorestart[[:space:]]+1'
+power_settings_applied() {
+  local settings
+  settings=$(pmset -g)
+  echo "$settings" | grep -qE 'autorestart[[:space:]]+1' || return 1
+  echo "$settings" | grep -qE '^[[:space:]]*sleep[[:space:]]+0' || return 1
+  echo "$settings" | grep -qE '^[[:space:]]*displaysleep[[:space:]]+0' || return 1
+  echo "$settings" | grep -qE '^[[:space:]]*disksleep[[:space:]]+0' || return 1
 }
 
 remote_login_enabled() {
@@ -933,7 +941,7 @@ check_state() {
     check_line OS_UPDATE 0 "update still pending"
   fi
 
-  if power_autorestart_enabled; then
+  if power_settings_applied; then
     check_line POWER_CONFIG 1 "confirmed"
   else
     check_line POWER_CONFIG 0 "not satisfied"
@@ -1033,8 +1041,8 @@ reconcile_state() {
     log "reconcile: no macOS update pending, backfilling OS_UPDATE"
     mark_done OS_UPDATE
   fi
-  if ! is_done POWER_CONFIG && power_autorestart_enabled; then
-    log "reconcile: power-on-after-failure already enabled, backfilling POWER_CONFIG"
+  if ! is_done POWER_CONFIG && power_settings_applied; then
+    log "reconcile: power/sleep settings already applied, backfilling POWER_CONFIG"
     mark_done POWER_CONFIG
   fi
   if ! is_done SSH_ENABLED && remote_login_enabled; then
@@ -1163,7 +1171,11 @@ run_steps() {
 
   if ! is_done POWER_CONFIG; then
     configure_power_on_ac
-    mark_done POWER_CONFIG
+    if power_settings_applied; then
+      mark_done POWER_CONFIG
+    else
+      log "WARNING: power/sleep settings did not verify after applying, will retry next run"
+    fi
   fi
 
   if ! is_done SSH_ENABLED; then
