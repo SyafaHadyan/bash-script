@@ -37,13 +37,13 @@
 #      Homebrew cask, which has had compatibility bugs on very new macOS
 #      versions), pre-configured to skip sending usage statistics. The
 #      first-run setup wizard itself is not suppressed - a person still
-#      clicks through it once at the monitor. Install Tailscale (Homebrew
-#      cask) and add it as a login item so it launches automatically - the
-#      actual "connect this device" login is deliberately not automated, do
-#      that manually at the monitor. Last: clean up General's Dock down to
-#      just Finder/Android Studio and remove all widgets/stacks (via
-#      dockutil) - run after Tailscale specifically since installing/
-#      launching it pins its own icon to the Dock too, which this wipes.
+#      clicks through it once at the monitor. Install Tailscale as a
+#      CLI-only Homebrew formula (no GUI app/menu-bar icon) and start
+#      tailscaled as a system service so it runs at boot regardless of
+#      login - actually joining the tailnet (tailscale up) is deliberately
+#      not automated, do that manually. Last: clean up General's Dock down
+#      to just Finder/Android Studio and remove all widgets/stacks (via
+#      dockutil).
 #
 # Other subcommands:
 #   update     re-copy an updated script and (re-)register the daemon;
@@ -496,7 +496,7 @@ configure_brew_shellenv_for_user() {
 }
 
 tailscale_installed() {
-  [ -d "/Applications/Tailscale.app" ]
+  [ -x "$BREW_PREFIX/bin/tailscale" ]
 }
 
 install_tailscale_for_user() {
@@ -506,36 +506,41 @@ install_tailscale_for_user() {
     return 0
   fi
   set_phase "installing Tailscale"
-  sudo -u "$user" "$BREW_PREFIX/bin/brew" install --cask tailscale 2>&1 | tee -a "$LOG_FILE"
+  # The CLI-only formula, deliberately not the "tailscale" cask - that cask
+  # always installs the full Tailscale.app GUI/menu-bar app, which isn't
+  # wanted here (no Dock/menu-bar icon, no GUI login item - just the
+  # tailscale/tailscaled binaries, managed entirely from the command line).
+  sudo -u "$user" "$BREW_PREFIX/bin/brew" install tailscale 2>&1 | tee -a "$LOG_FILE"
   if tailscale_installed; then
     log "Tailscale installed"
     return 0
   fi
-  log "ERROR: Tailscale.app not found in /Applications after brew install"
+  log "ERROR: tailscale binary not found at $BREW_PREFIX/bin/tailscale after brew install"
   return 1
 }
 
-tailscale_login_item_enabled() {
-  sudo -u "$1" osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null |
-    grep -qi "Tailscale"
+tailscale_service_running() {
+  "$BREW_PREFIX/bin/brew" services list 2>/dev/null | awk '$1 == "tailscale" {print $2}' | grep -qx "started"
 }
 
-enable_tailscale_launch_at_login() {
-  local user="$1"
-  if tailscale_login_item_enabled "$user"; then
-    log "Tailscale already set to launch at login for $user"
-    return
+# tailscaled needs root to manage the network stack, so this is started as
+# a system-wide launchd service (via brew services, run as root here) that
+# comes up at boot regardless of who's logged in - not a per-user login
+# item. Actually joining the tailnet (tailscale up / signing into an
+# identity provider) still needs a human at a terminal, deliberately not
+# automated here - do that manually.
+enable_tailscale_service() {
+  if tailscale_service_running; then
+    log "tailscaled service already running"
+    return 0
   fi
-  log "adding Tailscale as a login item for $user"
-  sudo -u "$user" osascript -e \
-    'tell application "System Events" to make login item at end with properties {path:"/Applications/Tailscale.app", hidden:false}' \
-    >/dev/null 2>&1
-  # Connecting the device itself (tailscale up / signing into an identity
-  # provider) needs a human at the GUI regardless - deliberately not
-  # automated here, do that manually. macOS may also prompt for a one-time
-  # System Settings > Network Extension approval on Tailscale's first
-  # launch, same class of manual step as approving any VPN/network
-  # extension app for the first time.
+  log "starting tailscaled as a system service (runs at boot regardless of login)"
+  "$BREW_PREFIX/bin/brew" services start tailscale >/dev/null 2>&1
+  tailscale_service_running
+}
+
+tailscale_ready() {
+  tailscale_installed && tailscale_service_running
 }
 
 android_studio_installed() {
@@ -681,9 +686,8 @@ configure_dock_for_user() {
   # dockutil's "all" clears the whole dock plist in one go - both the
   # left-side pinned-apps section and the right-side folders/stacks/widgets
   # section - so this single call covers "remove all widgets" too, not just
-  # the app icons. Runs after TAILSCALE (see run_steps ordering) so that
-  # Tailscale auto-pinning itself to the Dock on install/first launch gets
-  # wiped along with everything else, rather than surviving the cleanup.
+  # the app icons. Runs last (see run_steps ordering) so it's the final say
+  # over the Dock regardless of what earlier steps did along the way.
   sudo -u "$user" "$dockutil" --remove all --no-restart
   sudo -u "$user" "$dockutil" --add '/Applications/Android Studio.app' --no-restart
   sudo -u "$user" killall Dock >/dev/null 2>&1
@@ -970,7 +974,7 @@ check_state() {
     check_line ANDROID_STUDIO 0 "not satisfied"
   fi
 
-  if tailscale_installed; then
+  if tailscale_ready; then
     check_line TAILSCALE 1 "confirmed"
   else
     check_line TAILSCALE 0 "not satisfied"
@@ -1060,8 +1064,8 @@ reconcile_state() {
     log "reconcile: Android Studio already installed, backfilling ANDROID_STUDIO"
     mark_done ANDROID_STUDIO
   fi
-  if ! is_done TAILSCALE && tailscale_installed; then
-    log "reconcile: Tailscale already installed, backfilling TAILSCALE"
+  if ! is_done TAILSCALE && tailscale_ready; then
+    log "reconcile: Tailscale already installed and running, backfilling TAILSCALE"
     mark_done TAILSCALE
   fi
   if ! is_done DOCK_CLEANUP && dock_cleaned_up "$GENERAL_USER"; then
@@ -1214,22 +1218,20 @@ run_steps() {
 
   if ! is_done TAILSCALE; then
     if require_done HOMEBREW; then
-      if install_tailscale_for_user "$GENERAL_USER"; then
-        enable_tailscale_launch_at_login "$GENERAL_USER"
+      if install_tailscale_for_user "$GENERAL_USER" && enable_tailscale_service; then
         mark_done TAILSCALE
       else
-        log "WARNING: Tailscale installation did not succeed, will retry next run"
+        log "WARNING: Tailscale installation/service did not succeed, will retry next run"
       fi
     fi
   fi
 
   if ! is_done DOCK_CLEANUP; then
-    # Runs last, after ANDROID_STUDIO (needs the app to pin) and TAILSCALE
-    # (Tailscale pins itself to the Dock on install/first launch - cleanup
-    # needs to happen after that so it gets wiped too, not before it exists)
-    # - and HOMEBREW since configure_dock_for_user installs dockutil via
-    # brew. Without these guards, a machine where an earlier one of these
-    # got skipped would have this step fail every run with no obvious cause.
+    # Runs last: after ANDROID_STUDIO (needs the app to pin), HOMEBREW
+    # (configure_dock_for_user installs dockutil via brew), and TAILSCALE
+    # (just for ordering - it's CLI-only, no Dock icon of its own). Without
+    # these guards, a machine where an earlier one of these got skipped
+    # would have this step fail every run with no obvious cause.
     if require_done ANDROID_STUDIO && require_done HOMEBREW && require_done TAILSCALE; then
       if configure_dock_for_user "$GENERAL_USER"; then
         mark_done DOCK_CLEANUP
