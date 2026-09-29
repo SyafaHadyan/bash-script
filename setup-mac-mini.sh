@@ -645,9 +645,12 @@ install_homebrew_for_user() {
   set_phase "installing Homebrew for $user"
   # Homebrew refuses to run as root, and its installer needs the prefix dir
   # to already be writable by the target user to avoid its own sudo prompts.
+  # -H matters here too: this script runs as a launchd daemon with no $HOME
+  # set, and plain `sudo -u` doesn't switch it to the target user's home on
+  # its own - Homebrew hard-refuses to run at all without $HOME set.
   mkdir -p "$BREW_PREFIX"
   chown -R "$user:admin" "$BREW_PREFIX"
-  sudo -u "$user" /bin/bash -c \
+  sudo -H -u "$user" /bin/bash -c \
     "NONINTERACTIVE=1 $(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" \
     2>&1 | tee -a "$LOG_FILE"
 }
@@ -684,7 +687,7 @@ install_tailscale_for_user() {
   # always installs the full Tailscale.app GUI/menu-bar app, which isn't
   # wanted here (no Dock/menu-bar icon, no GUI login item - just the
   # tailscale/tailscaled binaries, managed entirely from the command line).
-  sudo -u "$user" "$BREW_PREFIX/bin/brew" install tailscale 2>&1 | tee -a "$LOG_FILE"
+  sudo -H -u "$user" "$BREW_PREFIX/bin/brew" install tailscale 2>&1 | tee -a "$LOG_FILE"
   if tailscale_installed; then
     log "Tailscale installed"
     return 0
@@ -716,7 +719,7 @@ enable_tailscale_service() {
   # but cannot as root! Run `brew update` without sudo first then try
   # again." Doing exactly that as the owning user warms the cache so the
   # root-invoked services start below has nothing left to fetch.
-  sudo -u "$user" "$BREW_PREFIX/bin/brew" update 2>&1 | tee -a "$LOG_FILE"
+  sudo -H -u "$user" "$BREW_PREFIX/bin/brew" update 2>&1 | tee -a "$LOG_FILE"
   "$BREW_PREFIX/bin/brew" services start tailscale 2>&1 | tee -a "$LOG_FILE"
   tailscale_service_running
 }
@@ -839,7 +842,7 @@ install_dockutil_for_user() {
   if dockutil_installed_for_user "$user"; then
     return 0
   fi
-  sudo -u "$user" "$BREW_PREFIX/bin/brew" install dockutil 2>&1 | tee -a "$LOG_FILE"
+  sudo -H -u "$user" "$BREW_PREFIX/bin/brew" install dockutil 2>&1 | tee -a "$LOG_FILE"
   dockutil_installed_for_user "$user"
 }
 
