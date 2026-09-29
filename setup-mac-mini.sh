@@ -323,9 +323,113 @@ suppress_first_login_setup_assistant() {
   sudo -u "$user" defaults write com.apple.SetupAssistant DidSeeAppearanceSetup -bool true
   sudo -u "$user" defaults write com.apple.SetupAssistant LastSeenCloudProductVersion -string "$os_version"
   sudo -u "$user" defaults write com.apple.SetupAssistant LastSeenBuddyBuildVersion -string "$os_build"
+  # A second, newer generation of per-account keys ("SkipX" rather than
+  # "DidSeeX") that a later macOS release apparently favors over the ones
+  # above - harmless to write both since they're independent keys, and this
+  # covers more OS versions than either family alone.
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipAppearance -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipCloudSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipiCloudStorageSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipPrivacySetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipScreenTime -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipSiriSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipTouchIDSetup -bool true
+  sudo -u "$user" defaults write com.apple.SetupAssistant SkipTrueTone -bool true
   # These exact keys/panes have shifted across macOS releases (same
   # unreliability class as auto-login itself) - if a screen still appears
   # on first login, check what's new for this OS version and add its key.
+  # As of macOS 15+, Apple's actively-documented replacement for both
+  # families above is install_setup_assistant_skip_profile() below - a
+  # config-profile-based SkipSetupItems array, not a per-account default.
+}
+
+setup_assistant_skip_profile_installed() {
+  profiles list -type configuration 2>/dev/null | grep -q "com.labsetup.macsetup.setupassistant.root"
+}
+
+# The modern (macOS 15+/Tahoe) mechanism: com.apple.SetupAssistant.managed's
+# SkipSetupItems array, normally pushed via MDM but installable locally as a
+# plain configuration profile via the `profiles` CLI - no MDM enrollment
+# needed. This is Apple's actively-maintained mechanism, unlike the
+# per-account DidSeeX/SkipX keys above which have become unreliable as
+# Apple keeps adding new screens (Apple Intelligence, "Choose Your Look",
+# etc.) that predate/postdate whichever key generation those cover.
+install_setup_assistant_skip_profile() {
+  if setup_assistant_skip_profile_installed; then
+    log "Setup Assistant skip-screens profile already installed"
+    return 0
+  fi
+  log "installing a local configuration profile to skip additional Setup Assistant screens (Accessibility, Data & Privacy, Apple Account sign-in, Analytics, Screen Time, Apple Intelligence, Appearance, etc.)"
+  local tmp payload_uuid profile_uuid
+  tmp=$(mktemp /tmp/skip-setup-XXXXXX).mobileconfig
+  payload_uuid=$(uuidgen)
+  profile_uuid=$(uuidgen)
+  cat >"$tmp" <<PROFILE
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key>
+      <string>com.apple.SetupAssistant.managed</string>
+      <key>PayloadIdentifier</key>
+      <string>com.labsetup.macsetup.setupassistant.payload</string>
+      <key>PayloadUUID</key>
+      <string>$payload_uuid</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>SkipSetupItems</key>
+      <array>
+        <string>Accessibility</string>
+        <string>Appearance</string>
+        <string>AppleID</string>
+        <string>Biometric</string>
+        <string>Diagnostics</string>
+        <string>DisplayTone</string>
+        <string>iCloudDiagnostics</string>
+        <string>iCloudStorage</string>
+        <string>Intelligence</string>
+        <string>Privacy</string>
+        <string>ScreenTime</string>
+        <string>Siri</string>
+        <string>TOS</string>
+        <string>TrueTone</string>
+        <string>Wallpaper</string>
+        <string>Welcome</string>
+      </array>
+    </dict>
+  </array>
+  <key>PayloadDisplayName</key>
+  <string>Lab Setup - Skip Setup Assistant Screens</string>
+  <key>PayloadIdentifier</key>
+  <string>com.labsetup.macsetup.setupassistant.root</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadScope</key>
+  <string>System</string>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>$profile_uuid</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>
+PROFILE
+  profiles install -type configuration -path "$tmp" 2>&1 | tee -a "$LOG_FILE"
+  rm -f "$tmp"
+  if setup_assistant_skip_profile_installed; then
+    log "Setup Assistant skip-screens profile installed"
+    return 0
+  fi
+  # Best-effort, not treated as fatal - the SETUP_ASSISTANT step still
+  # succeeds via the per-account keys above even if this specific piece
+  # doesn't take (e.g. if this macOS version requires MDM enrollment rather
+  # than a plain local profile for this particular payload).
+  log "WARNING: could not confirm the skip-screens profile installed - screens it would have covered may need clicking through manually once"
+  return 1
 }
 
 configure_autologin() {
@@ -1135,6 +1239,7 @@ step_SETUP_ASSISTANT() {
   is_done SETUP_ASSISTANT && return
   require_done GENERAL_CREATED || return
   suppress_first_login_setup_assistant "$GENERAL_USER"
+  install_setup_assistant_skip_profile
   mark_done SETUP_ASSISTANT
 }
 
@@ -1343,7 +1448,16 @@ PLIST
   if launchctl print "system/$LABEL" >/dev/null 2>&1; then
     launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
   else
-    launchctl bootstrap system "$PLIST_PATH" 2>/dev/null || launchctl load -w "$PLIST_PATH" 2>/dev/null
+    launchctl bootstrap system "$PLIST_PATH" 2>/dev/null
+    # Only fall back to the legacy loader if bootstrap genuinely didn't
+    # register the job - not just because it returned non-zero for some
+    # unrelated reason while still having loaded (and RunAtLoad-triggered)
+    # it. Chaining unconditionally on "||" risked both bootstrap and load
+    # registering/triggering the same RunAtLoad job, i.e. two concurrent
+    # run_steps() processes from a single install() call.
+    if ! launchctl print "system/$LABEL" >/dev/null 2>&1; then
+      launchctl load -w "$PLIST_PATH" 2>/dev/null
+    fi
   fi
   log "installed at $SCRIPT_INSTALL_PATH, daemon registered and started"
 }
