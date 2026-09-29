@@ -575,6 +575,12 @@ upgrade_macos() {
   current_major=$(sw_vers -productVersion | cut -d. -f1)
   latest_version=$(latest_full_installer_version)
   latest_major=$(echo "$latest_version" | cut -d. -f1)
+  # Apple's catalog is filtered per hardware model - a Mac not supported by
+  # the newest macOS release simply never has it listed here, so "latest
+  # available" and "actual newest macOS release" can genuinely differ
+  # machine to machine. Logged explicitly so a lower-than-expected pick is
+  # easy to tell apart from a real parsing/sorting bug.
+  log "OS update check: running macOS major $current_major, newest full installer this Mac is offered is $latest_version"
 
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
     set_phase "fetching full macOS installer (version $latest_version)"
