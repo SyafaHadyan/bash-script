@@ -89,6 +89,15 @@ LOCK_DIR="$STATE_DIR/run.lock"
 PHASE_FILE="$STATE_DIR/phase"
 GENERAL_USER_FILE="$STATE_DIR/general_username"
 LOG_FILE="/var/log/mac-mini-setup.log"
+# Separate from LOG_FILE deliberately: every meaningful line in this script
+# already explicitly appends to LOG_FILE itself (via log()'s own `tee -a`,
+# or an inline `2>&1 | tee -a "$LOG_FILE"`). Pointing launchd's
+# StandardOutPath/StandardErrorPath at that same file double-writes every
+# line - tee's append plus launchd's own capture of the inherited stdout/
+# stderr both land in the same file. This file exists only to catch
+# genuinely uncaught output (a raw bash error, an unhandled crash) that
+# never went through tee at all.
+LAUNCHD_RAW_LOG="/var/log/mac-mini-setup.launchd.log"
 SCRIPT_INSTALL_PATH="/usr/local/mac-setup/mac_mini_setup.sh"
 LABEL="com.labsetup.macsetup"
 PLIST_PATH="/Library/LaunchDaemons/$LABEL.plist"
@@ -549,8 +558,29 @@ upgrade_macos() {
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
     set_phase "fetching full macOS installer (version $latest_version)"
     softwareupdate --fetch-full-installer --full-installer-version "$latest_version" 2>&1 | tee -a "$LOG_FILE"
-    local installer_app
-    installer_app=$(ls -d "/Applications/Install macOS"*.app 2>/dev/null | head -1)
+    # Verify against the bundle's own version, not just "an installer app
+    # exists" - a stale "Install macOS *.app" left over from an earlier
+    # attempt (e.g. targeting an older major, from a previous run on this
+    # same machine) would otherwise get silently reused instead of the one
+    # just fetched, installing the wrong OS version with no indication.
+    local installer_app candidate installer_version
+    installer_app=""
+    for candidate in "/Applications/Install macOS"*.app; do
+      [ -d "$candidate" ] || continue
+      installer_version=$(defaults read "$candidate/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)
+      if [ "$installer_version" = "$latest_version" ]; then
+        installer_app="$candidate"
+        break
+      fi
+    done
+    if [ -z "$installer_app" ]; then
+      local stale
+      stale=$(ls -d "/Applications/Install macOS"*.app 2>/dev/null | head -1)
+      if [ -n "$stale" ]; then
+        log "WARNING: found installer app '$stale' but its version doesn't match the fetched $latest_version - removing stale installer"
+        rm -rf "$stale"
+      fi
+    fi
     if [ -n "$installer_app" ]; then
       set_phase "installing macOS $latest_version - machine will restart automatically when ready"
       # A Secure Token alone doesn't tell startosinstall which account to
@@ -843,7 +873,16 @@ configure_passwordless_sudo_for_admin() {
   local tmp
   tmp=$(mktemp)
   echo "%admin ALL=(ALL) NOPASSWD: ALL" >"$tmp"
-  if ! install -m 0440 -o root -g wheel "$tmp" "$marker"; then
+  # Absolute path, deliberately: this script defines its own install()
+  # function (the install/update subcommand) - bash resolves a bare
+  # command word against shell functions before $PATH, so a bare "install"
+  # here would silently call OUR function instead of /usr/bin/install,
+  # discarding every flag/argument. That was the actual cause of the
+  # SUDO_NOPASSWD "infinite loop" bug: the hijacked install() ends up
+  # calling launchctl kickstart -k on the already-loaded daemon, which
+  # kills and restarts the CURRENTLY RUNNING job (this very process) before
+  # it can ever finish or log an error, over and over.
+  if ! /usr/bin/install -m 0440 -o root -g wheel "$tmp" "$marker"; then
     log "ERROR: failed to write sudoers drop-in at $marker"
     rm -f "$tmp"
     return 1
@@ -1429,8 +1468,8 @@ install() {
     <string>run</string>
   </array>
   <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$LOG_FILE</string>
-  <key>StandardErrorPath</key><string>$LOG_FILE</string>
+  <key>StandardOutPath</key><string>$LAUNCHD_RAW_LOG</string>
+  <key>StandardErrorPath</key><string>$LAUNCHD_RAW_LOG</string>
 </dict>
 </plist>
 PLIST
