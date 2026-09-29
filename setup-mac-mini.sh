@@ -20,7 +20,7 @@
 #      Secure Token (via the Lab account's credentials - without this,
 #      General can't authorize OS installs at all), disable FileVault
 #      (required for auto-login to work at all), configure auto-login as
-#      General.
+#      General, and add a passwordless-sudo rule for the admin group.
 #   3. Pre-seed SetupAssistant markers so General's first-ever login skips
 #      the welcome/onboarding screens (Apple ID, Siri, Analytics, etc.), and
 #      apply the same appearance/mouse/lock-screen prefs to General.
@@ -54,6 +54,8 @@
 #      Also disable system/display/disk sleep entirely (pmset sleep 0).
 #
 # Other subcommands:
+#   install    copy self, register the LaunchDaemon, start provisioning
+#              (same as update - install/update are interchangeable)
 #   update     re-copy an updated script and (re-)register the daemon;
 #              run this after adding/changing steps to apply them to a
 #              machine that's already partway done or fully finished -
@@ -62,6 +64,8 @@
 #              so new steps can be inserted or appended anywhere without
 #              disturbing steps already completed on that machine
 #   status     show which steps are done/pending + recent log lines
+#   check      integrity check - compare marker files against live system
+#              state for every step and flag any mismatch, read-only
 #   reset      forget all progress, so a re-run starts from step 1 again
 #              (use this when re-purposing the script for a *new* Mac Mini)
 #   uninstall  remove the LaunchDaemon without touching recorded progress
@@ -80,6 +84,12 @@
 #   - The macOS upgrade step can take a long time (large download + install)
 #     and will reboot the machine on its own; do not expect it to finish
 #     quickly.
+#
+# Logs: /var/log/mac-mini-setup.log is the real one - every meaningful line
+# in this script explicitly appends to it. /var/log/mac-mini-setup.launchd.log
+# only catches output the daemon's own stdout/stderr picked up that never
+# went through the script's own logging (should normally be empty/rare) -
+# check it if something failed silently with nothing useful in the main log.
 
 set -uo pipefail
 
@@ -155,6 +165,11 @@ mark_done() {
   mkdir -p "$DONE_DIR"
   touch "$DONE_DIR/$1"
   log "marked done: $1"
+}
+
+unmark_done() {
+  rm -f "$DONE_DIR/$1"
+  log "cleared done marker: $1"
 }
 
 all_done() {
@@ -513,6 +528,16 @@ wait_for_internet() {
   log "internet connectivity confirmed"
 }
 
+# Single source of truth for "what's the newest fetchable full installer" -
+# os_update_pending() and upgrade_macos() both need this, kept in one place
+# so a future fix to the parsing/sorting can't accidentally land in only
+# one of them and let the two silently drift apart.
+latest_full_installer_version() {
+  softwareupdate --list-full-installers 2>/dev/null |
+    grep -o 'Version: [0-9.]*' | sed 's/Version: //' |
+    sort -t. -k1,1n -k2,2n -k3,3n | tail -1
+}
+
 # Live check instead of a trusted flag, deliberately: this step's own
 # reboot can kill the script before we can honestly confirm success, so
 # "done" must be verified against actual system state every time rather
@@ -520,9 +545,7 @@ wait_for_internet() {
 os_update_pending() {
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
-  latest_version=$(softwareupdate --list-full-installers 2>/dev/null |
-    grep -o 'Version: [0-9.]*' | sed 's/Version: //' |
-    sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  latest_version=$(latest_full_installer_version)
   latest_major=$(echo "$latest_version" | cut -d. -f1)
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
     return 0
@@ -550,9 +573,7 @@ upgrade_macos() {
   fi
   local current_major latest_version latest_major
   current_major=$(sw_vers -productVersion | cut -d. -f1)
-  latest_version=$(softwareupdate --list-full-installers 2>/dev/null |
-    grep -o 'Version: [0-9.]*' | sed 's/Version: //' |
-    sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+  latest_version=$(latest_full_installer_version)
   latest_major=$(echo "$latest_version" | cut -d. -f1)
 
   if [ -n "$latest_major" ] && [ "$latest_major" -gt "$current_major" ]; then
@@ -682,7 +703,7 @@ enable_tailscale_service() {
     return 0
   fi
   log "starting tailscaled as a system service (runs at boot regardless of login)"
-  "$BREW_PREFIX/bin/brew" services start tailscale >/dev/null 2>&1
+  "$BREW_PREFIX/bin/brew" services start tailscale 2>&1 | tee -a "$LOG_FILE"
   tailscale_service_running
 }
 
@@ -1011,8 +1032,14 @@ remote_login_enabled() {
 
 # Best-effort only - kickstart has no simple, documented one-line status
 # check, this is a commonly used proxy, not a guaranteed-accurate signal.
+# ARD_AllLocalUsers only goes true for an "all local users" configuration,
+# but enable_remote_management uses "-users $user" to grant access to just
+# the one named account, so that key alone never matches our setup - also
+# check the per-user Naprivs entry kickstart writes for a named-user grant.
 remote_management_enabled() {
-  [ "$(defaults read /Library/Preferences/com.apple.RemoteManagement.plist ARD_AllLocalUsers 2>/dev/null)" = "1" ]
+  local user="$1" plist="/Library/Preferences/com.apple.RemoteManagement.plist"
+  [ "$(defaults read "$plist" ARD_AllLocalUsers 2>/dev/null)" = "1" ] && return 0
+  defaults read "$plist" Naprivs 2>/dev/null | grep -qE "^[[:space:]]*$user[[:space:]]*="
 }
 
 homebrew_installed_for_user() {
@@ -1100,7 +1127,7 @@ check_state() {
     check_line SSH_ENABLED 0 "not satisfied"
   fi
 
-  if remote_management_enabled; then
+  if remote_management_enabled "$GENERAL_USER"; then
     check_line REMOTE_DESKTOP 1 "confirmed (best-effort check)"
   else
     check_line REMOTE_DESKTOP 0 "not satisfied (best-effort check)"
@@ -1163,6 +1190,13 @@ check_state() {
 # (BANNER has no system state to check; SWITCH_TO_GENERAL and REMOTE_DESKTOP
 # already self-guard inside their own functions too) - this covers the
 # steps where one exists.
+#
+# A few steps also go the other way: if reality has regressed out from
+# under an already-set marker (a macOS major upgrade is known to silently
+# reset Remote Login and the pmset sleep/autorestart settings back to
+# defaults), the marker is cleared so the step runs again. Only done for
+# steps that are cheap and non-disruptive to reapply - SSH_ENABLED and
+# POWER_CONFIG, not REMOTE_DESKTOP, for the restart-disruption reason above.
 reconcile_state() {
   if ! is_done LAB_PREFS; then
     local labuser
@@ -1200,7 +1234,16 @@ reconcile_state() {
     log "reconcile: Remote Login already enabled, backfilling SSH_ENABLED"
     mark_done SSH_ENABLED
   fi
-  if ! is_done REMOTE_DESKTOP && remote_management_enabled; then
+  # systemsetup -setremotelogin is cheap and non-disruptive to reapply, so
+  # unlike REMOTE_DESKTOP below, it's safe to clear this marker and let the
+  # step just run again - a major macOS upgrade is known to silently reset
+  # Remote Login back off, and without this the marker would stay stuck
+  # "done" forever while SSH stayed actually off.
+  if is_done SSH_ENABLED && ! remote_login_enabled; then
+    log "reconcile: SSH_ENABLED was marked done but Remote Login is currently off (likely reset by a macOS upgrade), clearing marker so it re-enables"
+    unmark_done SSH_ENABLED
+  fi
+  if ! is_done REMOTE_DESKTOP && remote_management_enabled "$GENERAL_USER"; then
     log "reconcile: Remote Management already enabled, backfilling REMOTE_DESKTOP"
     mark_done REMOTE_DESKTOP
   fi
@@ -1227,6 +1270,12 @@ reconcile_state() {
   if ! is_done POWER_CONFIG && power_settings_applied; then
     log "reconcile: power/sleep settings already applied, backfilling POWER_CONFIG"
     mark_done POWER_CONFIG
+  fi
+  # pmset is cheap and non-disruptive to reapply, same reasoning as
+  # SSH_ENABLED above - a major macOS upgrade can reset these too.
+  if is_done POWER_CONFIG && ! power_settings_applied; then
+    log "reconcile: POWER_CONFIG was marked done but settings no longer verify (likely reset by a macOS upgrade), clearing marker so it reapplies"
+    unmark_done POWER_CONFIG
   fi
 }
 
