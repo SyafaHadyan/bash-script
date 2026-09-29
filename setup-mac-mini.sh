@@ -29,16 +29,9 @@
 #      not before it, since that's what actually triggers General's first
 #      login and the onboarding-suppression markers need to already be in
 #      place by then.
-#   5. Wait for internet, then upgrade macOS to the latest available major
-#      version (falls back to ordinary updates if already current),
-#      restarting automatically as part of that.
-#   6. Set "start up automatically when power is restored" (pmset autorestart)
-#      - the closest real equivalent Mac Mini exposes to "power on when AC
-#      connected"; there is no literal laptop-style AC-power-on toggle.
-#      Also disable system/display/disk sleep entirely (pmset sleep 0).
-#   7. Enable Remote Login (SSH) and Remote Management/Screen Sharing
+#   5. Enable Remote Login (SSH) and Remote Management/Screen Sharing
 #      (access granted to General).
-#   8. Install Homebrew for General (a general-purpose dependency for future
+#   6. Install Homebrew for General (a general-purpose dependency for future
 #      steps). Install Android Studio directly from Google's DMG (not via
 #      Homebrew cask, which has had compatibility bugs on very new macOS
 #      versions), pre-configured to skip sending usage statistics. The
@@ -47,9 +40,18 @@
 #      CLI-only Homebrew formula (no GUI app/menu-bar icon) and start
 #      tailscaled as a system service so it runs at boot regardless of
 #      login - actually joining the tailnet (tailscale up) is deliberately
-#      not automated, do that manually. Last: clean up General's Dock down
-#      to just Finder/Android Studio and remove all widgets/stacks (via
+#      not automated, do that manually. Clean up General's Dock down to
+#      just Finder/Android Studio and remove all widgets/stacks (via
 #      dockutil).
+#   7. Last: wait for internet, then upgrade macOS to the latest available
+#      major version (falls back to ordinary updates if already current),
+#      restarting automatically as part of that - deliberately last, since
+#      everything above is quick/reversible and this is the one step that
+#      can take a long time and reboots the machine on its own.
+#   8. Set "start up automatically when power is restored" (pmset autorestart)
+#      - the closest real equivalent Mac Mini exposes to "power on when AC
+#      connected"; there is no literal laptop-style AC-power-on toggle.
+#      Also disable system/display/disk sleep entirely (pmset sleep 0).
 #
 # Other subcommands:
 #   update     re-copy an updated script and (re-)register the daemon;
@@ -103,11 +105,15 @@ fi
 GENERAL_PASS="123456789"
 LAB_PASS="12345"
 
-# Every step tracked here, in the order run_steps executes them. Completion
-# is tracked per-name (a marker file per step), not by position in this
-# list, so a new step can be inserted or appended anywhere later without
-# affecting whether already-finished steps re-run.
-STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SETUP_ASSISTANT GENERAL_PREFS BANNER SWITCH_TO_GENERAL OS_UPDATE POWER_CONFIG SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO TAILSCALE DOCK_CLEANUP)
+# The single source of truth for execution order - run_steps() loops over
+# this array and calls each step's step_<NAME> function in this order, so
+# reordering this list actually reorders execution (each step function
+# still declares its own real dependencies via require_done, so a careless
+# reorder fails safe - a step just skips itself and retries next run rather
+# than running out of order). Completion is tracked per-name (a marker file
+# per step), not by position, so a new step can be inserted or appended
+# anywhere without affecting whether already-finished steps re-run.
+STEPS=(LAB_PREFS GENERAL_CREATED SECURE_TOKEN SUDO_NOPASSWD SETUP_ASSISTANT GENERAL_PREFS BANNER SWITCH_TO_GENERAL SSH_ENABLED REMOTE_DESKTOP HOMEBREW ANDROID_STUDIO TAILSCALE DOCK_CLEANUP OS_UPDATE POWER_CONFIG)
 
 if [ "$(uname -m)" = "arm64" ]; then
   BREW_PREFIX="/opt/homebrew"
@@ -153,8 +159,9 @@ all_done() {
 # Guards steps that depend on another step having actually run first
 # (e.g. anything touching General's account needs GENERAL_CREATED). Returns
 # failure without marking the caller done, so it's retried on a later pass
-# instead of being marked complete despite its prerequisite missing -
-# matters if the step blocks below ever get reordered in the script.
+# instead of being marked complete despite its prerequisite missing - this
+# is what makes reordering STEPS safe, a step with an unmet dependency just
+# skips itself for now instead of running out of order.
 require_done() {
   if ! is_done "$1"; then
     log "WARNING: prerequisite '$1' not done yet, skipping this step for now"
@@ -944,18 +951,6 @@ check_state() {
     check_line SWITCH_TO_GENERAL 0 "not satisfied (active session: $console_user)"
   fi
 
-  if ! os_update_pending; then
-    check_line OS_UPDATE 1 "confirmed (no update pending)"
-  else
-    check_line OS_UPDATE 0 "update still pending"
-  fi
-
-  if power_settings_applied; then
-    check_line POWER_CONFIG 1 "confirmed"
-  else
-    check_line POWER_CONFIG 0 "not satisfied"
-  fi
-
   if remote_login_enabled; then
     check_line SSH_ENABLED 1 "confirmed"
   else
@@ -990,6 +985,18 @@ check_state() {
     check_line DOCK_CLEANUP 1 "confirmed"
   else
     check_line DOCK_CLEANUP 0 "not satisfied"
+  fi
+
+  if ! os_update_pending; then
+    check_line OS_UPDATE 1 "confirmed (no update pending)"
+  else
+    check_line OS_UPDATE 0 "update still pending"
+  fi
+
+  if power_settings_applied; then
+    check_line POWER_CONFIG 1 "confirmed"
+  else
+    check_line POWER_CONFIG 0 "not satisfied"
   fi
 
   echo
@@ -1046,14 +1053,6 @@ reconcile_state() {
     log "reconcile: $GENERAL_USER is already the active session, backfilling SWITCH_TO_GENERAL"
     mark_done SWITCH_TO_GENERAL
   fi
-  if ! is_done OS_UPDATE && ! os_update_pending; then
-    log "reconcile: no macOS update pending, backfilling OS_UPDATE"
-    mark_done OS_UPDATE
-  fi
-  if ! is_done POWER_CONFIG && power_settings_applied; then
-    log "reconcile: power/sleep settings already applied, backfilling POWER_CONFIG"
-    mark_done POWER_CONFIG
-  fi
   if ! is_done SSH_ENABLED && remote_login_enabled; then
     log "reconcile: Remote Login already enabled, backfilling SSH_ENABLED"
     mark_done SSH_ENABLED
@@ -1078,6 +1077,182 @@ reconcile_state() {
     log "reconcile: Dock already cleaned up for $GENERAL_USER, backfilling DOCK_CLEANUP"
     mark_done DOCK_CLEANUP
   fi
+  if ! is_done OS_UPDATE && ! os_update_pending; then
+    log "reconcile: no macOS update pending, backfilling OS_UPDATE"
+    mark_done OS_UPDATE
+  fi
+  if ! is_done POWER_CONFIG && power_settings_applied; then
+    log "reconcile: power/sleep settings already applied, backfilling POWER_CONFIG"
+    mark_done POWER_CONFIG
+  fi
+}
+
+# One function per entry in STEPS, each fully self-contained: checks its
+# own is_done, checks its own prerequisites via require_done, does the
+# work, verifies before marking done. run_steps() below just loops over
+# STEPS and calls these by name - the array is the ONLY place execution
+# order is defined, so reordering STEPS actually reorders execution. That's
+# a deliberate fix: STEPS used to be a display-only list while the real
+# order was a separately hand-maintained sequence of blocks inside
+# run_steps() - the two could (and did) drift apart silently.
+step_LAB_PREFS() {
+  is_done LAB_PREFS && return
+  local labuser
+  labuser=$(find_lab_user)
+  if [ -z "$labuser" ]; then
+    log "ERROR: no 'Lab Pembelajaran N' account found, cannot continue"
+    exit 1
+  fi
+  apply_user_prefs "$labuser"
+  mark_done LAB_PREFS
+}
+
+step_GENERAL_CREATED() {
+  is_done GENERAL_CREATED && return
+  create_general_account
+  disable_filevault_if_needed
+  configure_autologin "$GENERAL_USER" "$GENERAL_PASS"
+  mark_done GENERAL_CREATED
+}
+
+step_SECURE_TOKEN() {
+  is_done SECURE_TOKEN && return
+  require_done GENERAL_CREATED || return
+  grant_secure_token "$GENERAL_USER" "$GENERAL_PASS" "$(find_lab_user)" "$LAB_PASS"
+  if has_secure_token "$GENERAL_USER"; then
+    mark_done SECURE_TOKEN
+  else
+    log "WARNING: $GENERAL_USER still lacks a Secure Token, will retry next run"
+  fi
+}
+
+step_SUDO_NOPASSWD() {
+  is_done SUDO_NOPASSWD && return
+  configure_passwordless_sudo_for_admin && mark_done SUDO_NOPASSWD
+}
+
+step_SETUP_ASSISTANT() {
+  is_done SETUP_ASSISTANT && return
+  require_done GENERAL_CREATED || return
+  suppress_first_login_setup_assistant "$GENERAL_USER"
+  mark_done SETUP_ASSISTANT
+}
+
+step_GENERAL_PREFS() {
+  is_done GENERAL_PREFS && return
+  require_done GENERAL_CREATED || return
+  apply_user_prefs "$GENERAL_USER"
+  mark_done GENERAL_PREFS
+}
+
+step_BANNER() {
+  is_done BANNER && return
+  banner
+  mark_done BANNER
+}
+
+step_SWITCH_TO_GENERAL() {
+  is_done SWITCH_TO_GENERAL && return
+  # Must come after SETUP_ASSISTANT specifically - this is what actually
+  # triggers General's first-ever login (via logout + auto-login), so the
+  # welcome-screen suppression markers need to already be in place before
+  # this runs, not after. Running this first was the actual cause of the
+  # onboarding screens not being suppressed on first login. Enforced here
+  # via require_done rather than relying on STEPS ordering alone, so this
+  # stays safe even if the array gets reordered again later.
+  require_done GENERAL_CREATED || return
+  require_done SETUP_ASSISTANT || return
+  switch_to_general
+  mark_done SWITCH_TO_GENERAL
+}
+
+step_SSH_ENABLED() {
+  is_done SSH_ENABLED && return
+  enable_remote_login
+  mark_done SSH_ENABLED
+}
+
+step_REMOTE_DESKTOP() {
+  is_done REMOTE_DESKTOP && return
+  require_done GENERAL_CREATED || return
+  enable_remote_management "$GENERAL_USER"
+  mark_done REMOTE_DESKTOP
+}
+
+step_HOMEBREW() {
+  is_done HOMEBREW && return
+  require_done GENERAL_CREATED || return
+  install_homebrew_for_user "$GENERAL_USER"
+  configure_brew_shellenv_for_user "$GENERAL_USER"
+  if homebrew_installed_for_user "$GENERAL_USER"; then
+    mark_done HOMEBREW
+  else
+    log "WARNING: Homebrew installation for $GENERAL_USER did not succeed, will retry next run"
+  fi
+}
+
+step_ANDROID_STUDIO() {
+  is_done ANDROID_STUDIO && return
+  require_done GENERAL_CREATED || return
+  if install_android_studio; then
+    configure_android_studio_no_usage_stats "$GENERAL_USER"
+    mark_done ANDROID_STUDIO
+  else
+    log "WARNING: Android Studio installation did not succeed, will retry next run"
+  fi
+}
+
+step_TAILSCALE() {
+  is_done TAILSCALE && return
+  require_done HOMEBREW || return
+  if install_tailscale_for_user "$GENERAL_USER" && enable_tailscale_service; then
+    mark_done TAILSCALE
+  else
+    log "WARNING: Tailscale installation/service did not succeed, will retry next run"
+  fi
+}
+
+step_DOCK_CLEANUP() {
+  is_done DOCK_CLEANUP && return
+  # Depends on ANDROID_STUDIO (needs the app to pin), HOMEBREW
+  # (configure_dock_for_user installs dockutil via brew), and TAILSCALE
+  # (just for ordering - it's CLI-only, no Dock icon of its own). Without
+  # these guards, a machine where an earlier one of these got skipped
+  # would have this step fail every run with no obvious cause.
+  require_done ANDROID_STUDIO || return
+  require_done HOMEBREW || return
+  require_done TAILSCALE || return
+  if configure_dock_for_user "$GENERAL_USER"; then
+    mark_done DOCK_CLEANUP
+  else
+    log "WARNING: Dock cleanup for $GENERAL_USER did not succeed, will retry next run"
+  fi
+}
+
+step_OS_UPDATE() {
+  is_done OS_UPDATE && return
+  require_done SECURE_TOKEN || return
+  if os_update_pending; then
+    upgrade_macos
+    # only reaches here if upgrade_macos didn't need to trigger its own
+    # reboot (e.g. it found nothing left to do after all); re-check below
+    # rather than assuming that means success.
+  fi
+  if os_update_pending; then
+    log "WARNING: macOS update still appears pending, will retry on next run"
+  else
+    mark_done OS_UPDATE
+  fi
+}
+
+step_POWER_CONFIG() {
+  is_done POWER_CONFIG && return
+  configure_power_on_ac
+  if power_settings_applied; then
+    mark_done POWER_CONFIG
+  else
+    log "WARNING: power/sleep settings did not verify after applying, will retry next run"
+  fi
 }
 
 run_steps() {
@@ -1101,156 +1276,10 @@ run_steps() {
   # immediately if already connected.
   wait_for_internet
 
-  if ! is_done LAB_PREFS; then
-    local labuser
-    labuser=$(find_lab_user)
-    if [ -z "$labuser" ]; then
-      log "ERROR: no 'Lab Pembelajaran N' account found, cannot continue"
-      exit 1
-    fi
-    apply_user_prefs "$labuser"
-    mark_done LAB_PREFS
-  fi
-
-  if ! is_done GENERAL_CREATED; then
-    create_general_account
-    disable_filevault_if_needed
-    configure_autologin "$GENERAL_USER" "$GENERAL_PASS"
-    mark_done GENERAL_CREATED
-  fi
-
-  if ! is_done SECURE_TOKEN; then
-    if require_done GENERAL_CREATED; then
-      grant_secure_token "$GENERAL_USER" "$GENERAL_PASS" "$(find_lab_user)" "$LAB_PASS"
-      if has_secure_token "$GENERAL_USER"; then
-        mark_done SECURE_TOKEN
-      else
-        log "WARNING: $GENERAL_USER still lacks a Secure Token, will retry next run"
-      fi
-    fi
-  fi
-
-  if ! is_done SUDO_NOPASSWD; then
-    if configure_passwordless_sudo_for_admin; then
-      mark_done SUDO_NOPASSWD
-    fi
-  fi
-
-  if ! is_done SETUP_ASSISTANT; then
-    if require_done GENERAL_CREATED; then
-      suppress_first_login_setup_assistant "$GENERAL_USER"
-      mark_done SETUP_ASSISTANT
-    fi
-  fi
-
-  if ! is_done GENERAL_PREFS; then
-    if require_done GENERAL_CREATED; then
-      apply_user_prefs "$GENERAL_USER"
-      mark_done GENERAL_PREFS
-    fi
-  fi
-
-  if ! is_done BANNER; then
-    banner
-    mark_done BANNER
-  fi
-
-  if ! is_done SWITCH_TO_GENERAL; then
-    # Must come after SETUP_ASSISTANT specifically - this is what actually
-    # triggers General's first-ever login (via logout + auto-login), so the
-    # welcome-screen suppression markers need to already be in place before
-    # this runs, not after. Running this first was the actual cause of the
-    # onboarding screens not being suppressed on first login.
-    if require_done GENERAL_CREATED && require_done SETUP_ASSISTANT; then
-      switch_to_general
-      mark_done SWITCH_TO_GENERAL
-    fi
-  fi
-
-  if ! is_done OS_UPDATE; then
-    if require_done SECURE_TOKEN; then
-      if os_update_pending; then
-        upgrade_macos
-        # only reaches here if upgrade_macos didn't need to trigger its own
-        # reboot (e.g. it found nothing left to do after all); re-check below
-        # rather than assuming that means success.
-      fi
-      if os_update_pending; then
-        log "WARNING: macOS update still appears pending, will retry on next run"
-      else
-        mark_done OS_UPDATE
-      fi
-    fi
-  fi
-
-  if ! is_done POWER_CONFIG; then
-    configure_power_on_ac
-    if power_settings_applied; then
-      mark_done POWER_CONFIG
-    else
-      log "WARNING: power/sleep settings did not verify after applying, will retry next run"
-    fi
-  fi
-
-  if ! is_done SSH_ENABLED; then
-    enable_remote_login
-    mark_done SSH_ENABLED
-  fi
-
-  if ! is_done REMOTE_DESKTOP; then
-    if require_done GENERAL_CREATED; then
-      enable_remote_management "$GENERAL_USER"
-      mark_done REMOTE_DESKTOP
-    fi
-  fi
-
-  if ! is_done HOMEBREW; then
-    if require_done GENERAL_CREATED; then
-      install_homebrew_for_user "$GENERAL_USER"
-      configure_brew_shellenv_for_user "$GENERAL_USER"
-      if homebrew_installed_for_user "$GENERAL_USER"; then
-        mark_done HOMEBREW
-      else
-        log "WARNING: Homebrew installation for $GENERAL_USER did not succeed, will retry next run"
-      fi
-    fi
-  fi
-
-  if ! is_done ANDROID_STUDIO; then
-    if require_done GENERAL_CREATED; then
-      if install_android_studio; then
-        configure_android_studio_no_usage_stats "$GENERAL_USER"
-        mark_done ANDROID_STUDIO
-      else
-        log "WARNING: Android Studio installation did not succeed, will retry next run"
-      fi
-    fi
-  fi
-
-  if ! is_done TAILSCALE; then
-    if require_done HOMEBREW; then
-      if install_tailscale_for_user "$GENERAL_USER" && enable_tailscale_service; then
-        mark_done TAILSCALE
-      else
-        log "WARNING: Tailscale installation/service did not succeed, will retry next run"
-      fi
-    fi
-  fi
-
-  if ! is_done DOCK_CLEANUP; then
-    # Runs last: after ANDROID_STUDIO (needs the app to pin), HOMEBREW
-    # (configure_dock_for_user installs dockutil via brew), and TAILSCALE
-    # (just for ordering - it's CLI-only, no Dock icon of its own). Without
-    # these guards, a machine where an earlier one of these got skipped
-    # would have this step fail every run with no obvious cause.
-    if require_done ANDROID_STUDIO && require_done HOMEBREW && require_done TAILSCALE; then
-      if configure_dock_for_user "$GENERAL_USER"; then
-        mark_done DOCK_CLEANUP
-      else
-        log "WARNING: Dock cleanup for $GENERAL_USER did not succeed, will retry next run"
-      fi
-    fi
-  fi
+  local step
+  for step in "${STEPS[@]}"; do
+    "step_$step"
+  done
 
   if all_done; then
     log "all currently defined steps complete, removing scheduled daemon"
