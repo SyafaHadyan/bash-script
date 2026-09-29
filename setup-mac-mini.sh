@@ -1279,6 +1279,20 @@ run_steps() {
   local step
   for step in "${STEPS[@]}"; do
     "step_$step"
+    if [ "$step" = "BANNER" ] && ! is_done SWITCH_TO_GENERAL; then
+      # Temporary, for now: don't auto-switch to General - stop here and
+      # uninstall the daemon instead. Log into General manually, then
+      # re-curl the script and run 'update'; by then General is the active
+      # console user, so reconcile_state (top of this function) will have
+      # already backfilled SWITCH_TO_GENERAL as done on that next run, and
+      # execution continues past it normally from there. To resume full
+      # unattended auto-switching later, just delete this if-block.
+      log "pausing after BANNER (not auto-switching to $GENERAL_USER for now) - log in to $GENERAL_USER manually, then re-run 'update' to continue"
+      uninstall_daemon
+      set_phase "idle"
+      log "=== run finished (paused before switching to $GENERAL_USER) ==="
+      exit 0
+    fi
   done
 
   if all_done; then
