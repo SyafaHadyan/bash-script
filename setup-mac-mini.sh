@@ -698,11 +698,19 @@ tailscale_service_running() {
 # identity provider) still needs a human at a terminal, deliberately not
 # automated here - do that manually.
 enable_tailscale_service() {
+  local user="$1"
   if tailscale_service_running; then
     log "tailscaled service already running"
     return 0
   fi
   log "starting tailscaled as a system service (runs at boot regardless of login)"
+  # brew hard-refuses to download anything as root when its own Cellar is
+  # owned by a non-root user (it is here, Homebrew was installed for
+  # $user) - confirmed in practice: "Need to download .../packages...jws.json
+  # but cannot as root! Run `brew update` without sudo first then try
+  # again." Doing exactly that as the owning user warms the cache so the
+  # root-invoked services start below has nothing left to fetch.
+  sudo -u "$user" "$BREW_PREFIX/bin/brew" update 2>&1 | tee -a "$LOG_FILE"
   "$BREW_PREFIX/bin/brew" services start tailscale 2>&1 | tee -a "$LOG_FILE"
   tailscale_service_running
 }
@@ -1398,7 +1406,7 @@ step_ANDROID_STUDIO() {
 step_TAILSCALE() {
   is_done TAILSCALE && return
   require_done HOMEBREW || return
-  if install_tailscale_for_user "$GENERAL_USER" && enable_tailscale_service; then
+  if install_tailscale_for_user "$GENERAL_USER" && enable_tailscale_service "$GENERAL_USER"; then
     mark_done TAILSCALE
   else
     log "WARNING: Tailscale installation/service did not succeed, will retry next run"
